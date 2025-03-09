@@ -42,6 +42,7 @@ def main(config_name: str, max_frames: int | None = None):
     data_config, dataset = create_dataset(config)
 
     num_frames = len(dataset)
+    print(f"Computing stats for {num_frames} frames")
     shuffle = False
 
     if max_frames is not None and max_frames < num_frames:
