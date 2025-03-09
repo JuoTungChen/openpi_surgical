@@ -5,12 +5,13 @@ import einops
 import numpy as np
 
 from openpi import transforms
+from scipy.spatial.transform import Rotation as R
 
 
 def make_dvrk_example() -> dict:
     """Creates a random input example for the Aloha policy."""
     return {
-        "state": np.ones((20,)),
+        "state": np.ones((14,)),
         "images": {
             "left": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
             "right": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
@@ -30,13 +31,13 @@ def _parse_image(image) -> np.ndarray:
 
 
 @dataclasses.dataclass(frozen=True)
-class AlohaInputs(transforms.DataTransformFn):
+class DvrkInputs(transforms.DataTransformFn):
     """Inputs for the Aloha policy.
 
     Expected inputs:
     - images: dict[name, img] where img is [channel, height, width]. name must be in EXPECTED_CAMERAS.
-    - state: [20]
-    - actions: [action_horizon, 20]
+    - state: [14]
+    - actions: [action_horizon, 14]
     """
 
     # The action dimension of the model. Will be used to pad state and actions.
@@ -44,7 +45,7 @@ class AlohaInputs(transforms.DataTransformFn):
 
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model.
-    adapt_to_pi: bool = True
+    adapt_to_pi: bool = False
 
     # The expected cameras names. All input cameras must be in this set. Missing cameras will be
     # replaced with black images and the corresponding `image_mask` will be set to False.
@@ -88,31 +89,53 @@ class AlohaInputs(transforms.DataTransformFn):
             "image_mask": image_masks,
             "state": state,
         }
+        qpos_psm1 = data["state"][:8]
+        qpos_psm2 = data["state"][8:]
+        action_psm1 = data["actions"][:, :8]
+        action_psm2 = data["actions"][:, 8:]
+        # print("qpos_psm1: ", qpos_psm1)
+        # print("qpos_psm2: ", qpos_psm2)
+        # print("action_psm1: ", action_psm1.shape)
+        # print("action_psm2: ", action_psm2.shape)
+
+        diff_psm1 = None
+        diff_psm2 = None
+        # compute hybrid-relative actions. see: https://surgical-robot-transformer.github.io/
+        diff_psm1 = compute_diff_actions(qpos_psm1, action_psm1)
+        diff_psm2 = compute_diff_actions(qpos_psm2, action_psm2)
+
+        # stack the actions along column dim
+        diff_action = np.column_stack((diff_psm1, diff_psm2))
+
+        # print("diff_action: ", diff_action.shape)
+        # print("diff_action: ", diff_action)
 
         # Actions are only available during training.
         if "actions" in data:
             actions = np.asarray(data["actions"])
             # actions = _encode_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
-            inputs["actions"] = transforms.pad_to_dim(actions, self.action_dim)
+            inputs["actions"] = transforms.pad_to_dim(diff_action, self.action_dim)
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        # input("Press Enter to continue...")
+
 
         return inputs
 
 
 @dataclasses.dataclass(frozen=True)
-class AlohaOutputs(transforms.DataTransformFn):
+class DvrkOutputs(transforms.DataTransformFn):
     """Outputs for the Aloha policy."""
 
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model.
-    adapt_to_pi: bool = True
 
     def __call__(self, data: dict) -> dict:
         # Only return the first 14 dims.
         actions = np.asarray(data["actions"][:, :14])
-        return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
+        return {"actions": actions}
 
 
 def _joint_flip_mask() -> np.ndarray:
@@ -214,3 +237,62 @@ def _encode_actions_inv(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np
         actions = _joint_flip_mask() * actions
         actions[:, [6, 13]] = _gripper_from_angular_inv(actions[:, [6, 13]])
     return actions
+
+
+
+def compute_diff_actions(qpos, action):
+    """
+    Computes the relative actions with respect to the current position using axis-angle rotation.
+
+    Parameters:
+    - qpos: Current pose (array of shape [8] - xyz, xyzw, jaw angle)
+    - action: Actions commanded by the user (array of shape [n_actions x 8] - xyz, xyzw, jaw angle)
+
+    Returns:
+    - diff_expand: Relative actions with delta translation and delta rotation in axis-angle format.
+                Shape: (n_actions, 7) - [delta_translation, delta_rotation, jaw_angle]
+    """
+    # Compute the delta translation w.r.t da vinci endoscope tip frame (approx the camera frame)
+    delta_translation = action[:, 0:3] - qpos[0:3]  # Shape: (n_actions, 3)
+
+    # Extract quaternions from qpos and action
+    quat_init = qpos[3:7]          # Shape: (4,)
+    quat_actions = action[:, 3:7]  # Shape: (n_actions, 4)
+
+    # Convert quaternions to Rotation objects
+    r_init = R.from_quat(quat_init)
+    r_actions = R.from_quat(quat_actions)
+
+    # Compute the relative rotations
+    diff_rs = r_init.inv() * r_actions  # Shape: (n_actions,)
+
+    # Convert the rotation differences to rotation vectors (axis-angle representation)
+    delta_rotation = diff_rs.as_rotvec()  # Shape: (n_actions, 3)
+
+    # Extract the jaw angle from the action (note: jaw angle is not relative)
+    jaw_angle = action[:, -1]  # Shape: (n_actions,)
+
+    # Prepare the final diff array
+    delta_action = np.zeros((action.shape[0], 7))  # Shape: (n_actions, 7)
+
+    # Populate the diff_expand array
+    delta_action[:, 0:3] = delta_translation       # Delta translation
+    delta_action[:, 3:6] = delta_rotation          # Delta rotation (axis-angle)
+    delta_action[:, 6] = jaw_angle                 # Jaw angle (not relative)
+
+    return delta_action
+
+def normalize_actions(diffs):
+    """
+    diffs: n_actions x 14 (delta position [3], delta orientation (axis-angle) [6], jaw angle (absolute) [1]) for both grippers
+    return: normalized n_actions x 14 (zero mean unit variance)
+    Note: only position and orientation are normalized, jaw angle is kept as is (absolute)
+    the min / max value for each param is at the top of this script
+    """
+
+    diff_orig = diffs.copy()
+    normalized = (diffs - mean) / std
+    # replace w/ originals for jaw angles
+    normalized[:, 6] = diff_orig[:, 6]
+    normalized[:, 13] = diffs[:, 13]
+    return normalized
