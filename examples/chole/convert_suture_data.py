@@ -109,9 +109,8 @@ def read_images(image_dir: str, file_pattern: str) -> np.ndarray:
     else:
         return np.empty((0, 0, 0, 3), dtype=np.uint8)
 
-def process_episode(dataset, episode_path, output_base_dir, states_name, actions_name):
+def process_episode(dataset, episode_path, states_name, actions_name):
     """Processes a single episode, save the data to lerobot format"""
-    # episode_path, output_base_dir = args  # Unpack arguments
 
     # Paths to image directories
     left_dir = os.path.join(episode_path, 'left_img_dir')
@@ -150,6 +149,8 @@ def process_episode(dataset, episode_path, output_base_dir, states_name, actions
                 kinematics_data[n][i] for n in actions_name
             ]),
         }
+        # print("state", frame["observation.state"])
+        # print("action", frame["action"])
 
         for cam_name, images in [('left', left_images), ('right', right_images), ('endo_psm1', psm1_images), ('endo_psm2', psm2_images)]:
             if images.size > 0:
@@ -189,16 +190,13 @@ def process_episode(dataset, episode_path, output_base_dir, states_name, actions
     # )
 
 
-def process_all_episodes(base_dir: str, tissue_indices: List[int], output_base_dir: str):
+def process_all_episodes(base_dir: str, idx: int, tissue_indices: List[int], repo_id: str):
     """Processes all episodes for given tissue indices using multiprocessing."""
 
-    idx = 0
 
-
-
-    if (LEROBOT_HOME / output_base_dir).exists():
+    if (LEROBOT_HOME / repo_id).exists():
        print("removing existing dataset")
-       shutil.rmtree(LEROBOT_HOME / output_base_dir)
+       shutil.rmtree(LEROBOT_HOME / repo_id)
     
     episode_paths = []
     states_name = [
@@ -209,6 +207,7 @@ def process_all_episodes(base_dir: str, tissue_indices: List[int], output_base_d
         "psm1_pose.orientation.y",
         "psm1_pose.orientation.z",
         "psm1_pose.orientation.w",
+        "psm1_jaw",
         "psm2_pose.position.x",
         "psm2_pose.position.y",
         "psm2_pose.position.z",
@@ -216,6 +215,8 @@ def process_all_episodes(base_dir: str, tissue_indices: List[int], output_base_d
         "psm2_pose.orientation.y",
         "psm2_pose.orientation.z",
         "psm2_pose.orientation.w",
+        "psm2_jaw",
+
     ]
     actions_name = [
         "psm1_sp.position.x",
@@ -225,6 +226,7 @@ def process_all_episodes(base_dir: str, tissue_indices: List[int], output_base_d
         "psm1_sp.orientation.y",
         "psm1_sp.orientation.z",
         "psm1_sp.orientation.w",
+        "psm1_jaw_sp",
         "psm2_sp.position.x",
         "psm2_sp.position.y",
         "psm2_sp.position.z",
@@ -232,10 +234,11 @@ def process_all_episodes(base_dir: str, tissue_indices: List[int], output_base_d
         "psm2_sp.orientation.y",
         "psm2_sp.orientation.z",
         "psm2_sp.orientation.w",
+        "psm2_jaw_sp",
     ]
     # create empty dataset
     dataset = create_empty_dataset(
-        repo_id=output_base_dir,
+        repo_id=repo_id,
         robot_type="dvrk",
         states_name=states_name,
         actions_name=actions_name,
@@ -263,7 +266,7 @@ def process_all_episodes(base_dir: str, tissue_indices: List[int], output_base_d
             episode_dir = os.path.join(subtask_dir, episode_name)
             if not os.path.isdir(episode_dir):
                 continue
-            dataset = process_episode(dataset, episode_dir, output_base_dir, states_name, actions_name)
+            dataset = process_episode(dataset, episode_dir, states_name, actions_name)
             # input("episode processed successful, press Enter to continue...")
 
             # Collect the episode path and output directory
@@ -357,8 +360,9 @@ if __name__ == "__main__":
     # output_base_dir = './processed_data'  # New folder for Zarr files
     base_dir = "/home/iulian/chole_ws/data/Jesse"  # Name of the output dataset, also used for the Hugging Face Hub
     output_base_dir = "/home/iulian/chole_ws/data/suturing_lerobot"  # Name of the output dataset, also used for the Hugging Face Hub
+    repo_id = "suturing_lerobot"  # Name of the output dataset, also used for the Hugging Face Hub
+    tissue_indices = [1, 2, 4, 5, 6, 8, 12, 13, 14, 18, 19, 22, 23, 30, 32, 35, 39, 40, 41, 47, 49, 50, 53, 54, 71, 72, 73, 75, 77, 80]  # Replace with your list of indices
+    idx = 0
 
-    tissue_indices = [1, 4, 5, 6, 8, 12, 13, 14, 18, 19, 22, 23, 30, 32, 35, 39, 40, 41, 47, 49, 50, 53, 54, 71, 72, 73, 75, 77, 80]  # Replace with your list of indices
-
-    process_all_episodes(base_dir, tissue_indices, output_base_dir)
+    process_all_episodes(base_dir, idx, tissue_indices, repo_id)
 
