@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.dvrk_policy as dvrk_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
@@ -202,7 +203,7 @@ class SimpleDataConfig(DataConfigFactory):
 class LeRobotDvrkDataConfig(DataConfigFactory):
     # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
     # Gripper dimensions will remain in absolute values.
-    use_delta_joint_actions: bool = True
+    use_delta_joint_actions: bool = False
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
     # If true, this will convert the joint and gripper values from the standard Aloha space to
@@ -230,8 +231,8 @@ class LeRobotDvrkDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[aloha_policy.AlohaInputs(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi)],
-            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+            inputs=[dvrk_policy.DvrkInputs(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi)],
+            outputs=[dvrk_policy.DvrkOutputs()],
         )
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
@@ -583,7 +584,7 @@ _CONFIGS = [
         name="dvrk_suturing",
         model=pi0.Pi0Config(),
         data=LeRobotDvrkDataConfig(
-            repo_id="/home/iulian/chole_ws/data/suturing_lerobot",
+            repo_id="suturing_lerobot",
             assets=AssetsConfig(
                 assets_dir="/home/iulian/chole_ws/data/suturing_lerobot",
                 asset_id="dvrk_suturing",
@@ -606,12 +607,47 @@ _CONFIGS = [
                 ]
             ),
             base_config=DataConfig(
-                local_files_only=False,  # Set to True for local-only datasets.
+                local_files_only=True,  # Set to True for local-only datasets.
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
     ),
+
+    TrainConfig(
+        name="dvrk_suturing_test",
+        model=pi0.Pi0Config(),
+        data=LeRobotDvrkDataConfig(
+            repo_id="suturing_lerobot_test",
+            assets=AssetsConfig(
+                assets_dir="/home/iulian/chole_ws/src/openpi/assets/dvrk_suturing_test",
+                asset_id="suturing_lerobot_test",
+            ),
+            default_prompt="test",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "left": "observation.images.left",
+                                "right": "observation.images.right",
+                                "endo_psm1": "observation.images.endo_psm1",
+                                "endo_psm2": "observation.images.endo_psm2",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+    ),
+
 
     # This config is used to demonstrate how to train on a simple simulated environment.
     TrainConfig(
