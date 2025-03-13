@@ -15,11 +15,13 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
+    DVRK = "dvrk"
 
 
 @dataclasses.dataclass
 class Args:
     host: str = "0.0.0.0"
+    # host: str = "10.160.217.171"
     port: int = 8000
 
     env: EnvMode = EnvMode.ALOHA_SIM
@@ -28,6 +30,7 @@ class Args:
 
 def main(args: Args) -> None:
     obs_fn = {
+        EnvMode.DVRK: _random_observation_dvrk,
         EnvMode.ALOHA: _random_observation_aloha,
         EnvMode.ALOHA_SIM: _random_observation_aloha,
         EnvMode.DROID: _random_observation_droid,
@@ -41,7 +44,8 @@ def main(args: Args) -> None:
     logging.info(f"Server metadata: {policy.get_server_metadata()}")
 
     # Send 1 observation to make sure the model is loaded.
-    policy.infer(obs_fn())
+    action_chunk = policy.infer(obs_fn())
+
 
     start = time.time()
     for _ in range(args.num_steps):
@@ -50,7 +54,7 @@ def main(args: Args) -> None:
 
     print(f"Total time taken: {end - start:.2f} s")
     print(f"Average inference time: {1000 * (end - start) / args.num_steps:.2f} ms")
-
+    print(f"action_chunk: {action_chunk}")
 
 def _random_observation_aloha() -> dict:
     return {
@@ -60,6 +64,20 @@ def _random_observation_aloha() -> dict:
             "cam_low": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
             "cam_left_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
             "cam_right_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
+        },
+        "prompt": "do something",
+    }
+
+def _random_observation_dvrk() -> dict:
+    return {
+        "state": np.ones((14,)),
+        # "actions": np.ones((14,50)),
+
+        "images": {
+            "left": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
+            "right": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
+            "endo_psm1": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
+            "endo_psm2": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
         },
         "prompt": "do something",
     }
