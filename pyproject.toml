@@ -38,6 +38,9 @@ dependencies = [
     "beartype>=0.19.0",
     "treescope>=0.1.7",
     "transformers==4.48.1",
+    "simplejpeg>=1.8.2",
+    "tensorflow-datasets>=4.9.7",
+    "albumentations>=2.0.5",
 ]
 
 

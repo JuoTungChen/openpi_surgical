@@ -12,6 +12,10 @@ from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
 from openpi.shared import normalize as _normalize
 
+import torch
+from torchvision import transforms, utils
+import albumentations as A
+
 DataDict: TypeAlias = at.PyTree
 NormStats: TypeAlias = _normalize.NormStats
 
@@ -183,6 +187,96 @@ class ResizeImages(DataTransformFn):
         data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
         return data
 
+@dataclasses.dataclass(frozen=True)
+class DataAugImages(DataTransformFn):
+    img_hw: tuple[int, int]
+    ratio: float = 0.95
+    mask_prob: float = 0.07
+    
+    # Move transform initialization to class attributes since frozen dataclass can't modify in __post_init__
+    random_crop: transforms.RandomCrop = dataclasses.field(init=False, default=None)
+    resize: transforms.Resize = dataclasses.field(init=False, default=None)
+    random_rot: transforms.RandomRotation = dataclasses.field(init=False, default=None)
+    composed: transforms.Compose = dataclasses.field(init=False, default=None)
+    color_jitter: transforms.ColorJitter = dataclasses.field(init=False, default=None)
+    albumentations_transforms: A.Compose = dataclasses.field(init=False, default=None)
+
+    def __post_init__(self):
+        # Use object.__setattr__ to set fields in frozen dataclass
+        object.__setattr__(self, 'resize', transforms.Resize(self.img_hw, antialias=True))
+        object.__setattr__(self, 'random_crop', transforms.RandomCrop(size=[int(self.img_hw[0] * self.ratio),
+                                                                          int(self.img_hw[1] * self.ratio)]))
+        object.__setattr__(self, 'random_rot', transforms.RandomRotation(degrees=[-5.0, 5.0], expand=False))
+        object.__setattr__(self, 'composed', transforms.Compose([self.resize,
+                                                                 self.random_crop,
+                                                                 self.random_rot]))
+        object.__setattr__(self, 'color_jitter', transforms.ColorJitter(brightness=0.2, contrast=0.4, 
+                                                                       saturation=0.5, hue=0.08))
+
+        min_height = max(1, self.img_hw[0] // 40)
+        min_width = max(1, self.img_hw[1] // 40) 
+        max_height = min(self.img_hw[0] // 30, self.img_hw[0])
+        max_width = min(self.img_hw[1] // 30, self.img_hw[1])
+
+        object.__setattr__(self, 'albumentations_transforms', A.Compose([
+            A.CoarseDropout(num_holes_range=(1,128), hole_height_range=(min_height,max_height), hole_width_range=(min_width,max_width), fill=0, p=0.5),
+        ]))
+
+    def random_shift(self, img, max_shift_ratio=0.2):
+        max_shift_x = int(self.img_hw[1] * max_shift_ratio)
+        max_shift_y = int(self.img_hw[0] * max_shift_ratio)
+        shift_x = np.random.randint(-max_shift_x, max_shift_x)
+        shift_y = np.random.randint(-max_shift_y, max_shift_y)
+        img = transforms.functional.affine(img, angle=0, translate=(shift_x, shift_y), scale=1, shear=0)
+        return img
+    
+    def __call__(self, data: DataDict) -> DataDict:
+        if "image" not in data:
+            return data
+
+        for key, img in data["image"].items():
+            print(key)
+            # Convert JAX array to numpy array
+            img = np.array(img)
+            
+            # Convert from (B,H,W,C) to (B,C,H,W) 
+            img = torch.from_numpy(img).permute(0, 3, 1, 2)
+            
+            # Apply transforms to each image in batch
+            transformed_imgs = []
+            for i in range(img.shape[0]):
+                img_i = img[i]
+                
+                # Apply transforms
+                img_i = self.composed(img_i)
+                img_i = self.color_jitter(img_i)
+                if key == "left":
+                    img_i = self.random_shift(img_i)
+                    
+                transformed_imgs.append(img_i)
+                
+            # Stack transformed images back into batch
+            img = torch.stack(transformed_imgs)
+            
+            # Convert back to numpy array with shape (B,H,W,C)
+            img = img.permute(0, 2, 3, 1).numpy()
+            
+            # Apply albumentations transforms to each image
+            transformed_imgs = []
+            for i in range(img.shape[0]):
+                img_i = self.albumentations_transforms(image=img[i])["image"]
+                
+                # Randomly mask image
+                if np.random.rand() < self.mask_prob:
+                    img_i = np.zeros_like(img_i)
+                    
+                transformed_imgs.append(img_i)
+                
+            img = np.stack(transformed_imgs)
+            
+            data["image"][key] = img
+
+        return data
 
 @dataclasses.dataclass(frozen=True)
 class SubsampleActions(DataTransformFn):
