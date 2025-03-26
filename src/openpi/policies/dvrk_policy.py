@@ -90,23 +90,23 @@ class DvrkInputs(transforms.DataTransformFn):
         }
 
         # print(data["action"])
-        # if 'actions' in data:
-        #     qpos_psm1 = data["state"][:8]
-        #     qpos_psm2 = data["state"][8:]
+        if 'actions' in data:
+            qpos_psm1 = data["state"][:8]
+            qpos_psm2 = data["state"][8:]
 
-        #     action_psm1 = data["action"][:, :8]
-        #     action_psm2 = data["action"][:, 8:]
+            action_psm1 = data["action"][:, :8]
+            action_psm2 = data["action"][:, 8:]
 
-        #     diff_psm1 = None
-        #     diff_psm2 = None
-        #     # compute hybrid-relative actions. see: https://surgical-robot-transformer.github.io/
-        #     diff_psm1 = compute_diff_actions(qpos_psm1, action_psm1)
-        #     diff_psm2 = compute_diff_actions(qpos_psm2, action_psm2)
+            diff_psm1 = None
+            diff_psm2 = None
+            # compute hybrid-relative actions. see: https://surgical-robot-transformer.github.io/
+            diff_psm1 = compute_diff_actions(qpos_psm1, action_psm1)
+            diff_psm2 = compute_diff_actions(qpos_psm2, action_psm2)
 
-        #     # stack the actions along column dim
-        #     diff_action = np.column_stack((diff_psm1, diff_psm2))
+            # stack the actions along column dim
+            diff_action = np.column_stack((diff_psm1, diff_psm2))
 
-        #     inputs["actions"] = transforms.pad_to_dim(diff_action, self.action_dim)
+            inputs["actions"] = transforms.pad_to_dim(diff_action, self.action_dim)
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
