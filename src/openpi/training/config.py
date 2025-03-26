@@ -110,6 +110,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.DataAugImages(img_hw=(224, 224), ratio=0.95, mask_prob=0.1),  # data augmentation
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
@@ -196,6 +197,53 @@ class SimpleDataConfig(DataConfigFactory):
             use_quantile_norm=model_config.model_type == ModelType.PI0_FAST,
         )
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotDvrk6dDataConfig(DataConfigFactory):
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = False
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    # the space used by the pi internal runtime which was used to train the base model. People who
+    # use standard Aloha data should set this to true.
+    adapt_to_pi: bool = False
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"left": "observation.images.left"},
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[dvrk_policy.DvrkInputs_6D(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi)],
+            outputs=[dvrk_policy.DvrkOutputs_6d()],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
 
 
 
@@ -231,7 +279,7 @@ class LeRobotDvrkDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[dvrk_policy.DvrkInputs_(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi)],
+            inputs=[dvrk_policy.DvrkInputs(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi)],
             outputs=[dvrk_policy.DvrkOutputs()],
         )
         if self.use_delta_joint_actions:
@@ -662,8 +710,157 @@ _CONFIGS = [
         num_train_steps=20_000,
         fsdp_devices=2,
     ),
+    TrainConfig(
+        name="dvrk_suturing_bs64",
+        model=pi0.Pi0Config(),
+        data=LeRobotDvrkDataConfig(
+            repo_id="suturing_lerobot",
+            assets=AssetsConfig(
+                assets_dir="/cis/home/sschmi46/chole_ws/src/openpi_surgical/assets/dvrk_suturing/",
+                asset_id="suturing_lerobot",
+            ),
+            default_prompt="1_needle_pickup",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "left": "observation.images.left",
+                                "right": "observation.images.right",
+                                "endo_psm1": "observation.images.endo_psm1",
+                                "endo_psm2": "observation.images.endo_psm2",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        fsdp_devices=1,
+        batch_size=64,
+    ),
 
-
+    TrainConfig(
+        name="dvrk_suturing_lora_bs128",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotDvrkDataConfig(
+            repo_id="suturing_lerobot",
+            assets=AssetsConfig(
+                assets_dir="/cis/home/sschmi46/chole_ws/src/openpi_surgical/assets/dvrk_suturing/",
+                asset_id="suturing_lerobot",
+            ),
+            default_prompt="1_needle_pickup",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "left": "observation.images.left",
+                                "right": "observation.images.right",
+                                "endo_psm1": "observation.images.endo_psm1",
+                                "endo_psm2": "observation.images.endo_psm2",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        fsdp_devices=2,
+        batch_size=128,
+    ),
+    TrainConfig(
+        name="dvrk_suturing_fc_bs64_mono_no_state",
+        model=pi0.Pi0Config(),
+        data=LeRobotDvrkNoStatesDataConfig(
+            repo_id="suturing_lerobot",
+            assets=AssetsConfig(
+                assets_dir="/cis/home/sschmi46/chole_ws/src/openpi_surgical/assets/dvrk_suturing/",
+                asset_id="suturing_lerobot",
+            ),
+            default_prompt="1_needle_pickup",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "left": "observation.images.left",
+                                "endo_psm1": "observation.images.endo_psm1",
+                                "endo_psm2": "observation.images.endo_psm2",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        #weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100_000,
+        fsdp_devices=2,
+        batch_size=64,
+    ),
+    TrainConfig(
+        name="dvrk_suturing_fc_6d",
+        model=pi0.Pi0Config(),
+        data=LeRobotDvrk6dDataConfig(
+            repo_id="suturing_lerobot_new",
+            assets=AssetsConfig(
+                assets_dir="/home/iulian/chole_ws/src/openpi/assets/dvrk_suturing_fc_6d/",
+                asset_id="suturing_lerobot_new",
+            ),
+            default_prompt="1_needle_pickup",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "left": "observation.images.left",
+                                "endo_psm1": "observation.images.endo_psm1",
+                                "endo_psm2": "observation.images.endo_psm2",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        #weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100_000,
+        fsdp_devices=2,
+        batch_size=64,
+    ),
     TrainConfig(
         name="dvrk_suturing_test",
         model=pi0.Pi0Config(),
