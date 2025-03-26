@@ -127,7 +127,7 @@ def process_episode(dataset, episode_path, states_name, actions_name):
     right_images = read_images(right_dir, 'frame{:06d}_right.jpg')
     psm1_images = read_images(psm1_dir, 'frame{:06d}_psm1.jpg')
     psm2_images = read_images(psm2_dir, 'frame{:06d}_psm2.jpg')
-    print(left_images.shape, right_images.shape, psm1_images.shape, psm2_images.shape)
+    # print(left_images.shape, right_images.shape, psm1_images.shape, psm2_images.shape)
     num_frames = min(len(df), left_images.shape[0])
 
     # Read kinematics data and convert to structured array with headers
@@ -194,10 +194,11 @@ def process_all_episodes(base_dir: str, idx: int, tissue_indices: List[int], rep
     """Processes all episodes for given tissue indices using multiprocessing."""
 
 
-    if (LEROBOT_HOME / repo_id).exists():
-       print("removing existing dataset")
-       shutil.rmtree(LEROBOT_HOME / repo_id)
-    
+    # if (LEROBOT_HOME / repo_id).exists():
+    #    print("removing existing dataset")
+    #    shutil.rmtree(LEROBOT_HOME / repo_id)
+
+
     episode_paths = []
     states_name = [
         "psm1_pose.position.x",
@@ -236,15 +237,35 @@ def process_all_episodes(base_dir: str, idx: int, tissue_indices: List[int], rep
         "psm2_sp.orientation.w",
         "psm2_jaw_sp",
     ]
-    # create empty dataset
-    dataset = create_empty_dataset(
-        repo_id=repo_id,
-        robot_type="dvrk",
-        states_name=states_name,
-        actions_name=actions_name,
-        mode="image",
-        dataset_config=DEFAULT_DATASET_CONFIG,
-    )
+
+    
+    dataset_path = LEROBOT_HOME / repo_id
+
+    if not dataset_path.exists():
+        print(f"Creating new dataset: {repo_id}")
+        # create empty dataset
+        dataset = create_empty_dataset(
+            repo_id=repo_id,
+            robot_type="dvrk",
+            states_name=states_name,
+            actions_name=actions_name,
+            mode="image",
+            dataset_config=DEFAULT_DATASET_CONFIG,
+        )
+    else:
+        # print(f"Resuming conversion. Existing dataset found at {dataset_path}")
+        dataset = create_dataset(
+            repo_id=repo_id,
+            robot_type="dvrk",
+            states_name=states_name,
+            actions_name=actions_name,
+            mode="image",
+            dataset_config=DEFAULT_DATASET_CONFIG,
+        )
+        num_episodes = dataset.num_episodes
+        print(f"Resuming conversion. Existing dataset found at {dataset_path} with {num_episodes} episodes")
+
+
     # input("dataset created successful, press Enter to continue...")
 
     # measure time taken to complete the process
@@ -256,7 +277,7 @@ def process_all_episodes(base_dir: str, idx: int, tissue_indices: List[int], rep
         print(f"Warning: {tissue_dir} does not exist.")
         exit()
         # continue
-
+    count = 0
     for subtask_name in os.listdir(tissue_dir):
         subtask_dir = os.path.join(tissue_dir, subtask_name)
         if not os.path.isdir(subtask_dir):
@@ -265,6 +286,10 @@ def process_all_episodes(base_dir: str, idx: int, tissue_indices: List[int], rep
         for episode_name in os.listdir(subtask_dir):
             episode_dir = os.path.join(subtask_dir, episode_name)
             if not os.path.isdir(episode_dir):
+                continue
+            if count < num_episodes:
+                count += 1
+                print(f"Skipping episode {episode_dir}")
                 continue
             dataset = process_episode(dataset, episode_dir, states_name, actions_name)
             # input("episode processed successful, press Enter to continue...")
@@ -288,9 +313,69 @@ def process_all_episodes(base_dir: str, idx: int, tissue_indices: List[int], rep
     #     pool.map(process_episode, episode_paths)
 
 
+def create_dataset(
+    repo_id: str,
+    robot_type: str,
+    states_name: List[str],
+    actions_name: List[str],
+    mode: Literal["video", "image"] = "image",
+    *,
+    # has_velocity: bool = False,
+    # has_effort: bool = False,
+    dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
+) -> LeRobotDataset:
+    
+    cameras = [
+        "left",
+        "right",
+        "endo_psm1",
+        "endo_psm2",
+    ]
 
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (len(states_name),),
+            "names": [
+                states_name,
+            ],
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (len(actions_name),),
+            "names": [
+                actions_name,
+            ],
+        },
+    }
+
+    for cam in cameras:
+        features[f"observation.images.{cam}"] = {
+            "dtype": mode,
+            "shape": (480, 640, 3) if cam.startswith("endo") else (540, 960, 3),
+            "names": [
+                "height",
+                "width",
+                "channels",
+            ],
+        }
+
+    # if Path(LEROBOT_HOME / repo_id).exists():
+    #     shutil.rmtree(LEROBOT_HOME / repo_id)
+    dataset = LeRobotDataset(
+        repo_id=repo_id,
+        local_files_only=True,
+        # robot_type=robot_type,
+        # features=features,
+        # use_videos=dataset_config.use_videos,
+        tolerance_s=dataset_config.tolerance_s,
+        video_backend=dataset_config.video_backend,
+    )
+    dataset.start_image_writer(dataset_config.image_writer_processes, dataset_config.image_writer_threads)
+    return dataset
 
 def create_empty_dataset(
+        
     repo_id: str,
     robot_type: str,
     states_name: List[str],
