@@ -242,7 +242,7 @@ def process_all_chole_episodes(base_dir: str, tissue_indices: List[int], repo_id
     count = 0
 
     for idx in tissue_indices:
-        tissue_dir = os.path.join(base_dir, f'tissue_{tissue_indices[idx]}')
+        tissue_dir = os.path.join(base_dir, f'tissue_{idx}')
         if not os.path.exists(tissue_dir):
             print(f"Warning: {tissue_dir} does not exist.")
             exit()
@@ -272,7 +272,7 @@ def process_all_chole_episodes(base_dir: str, tissue_indices: List[int], repo_id
 
             # input("subtask processed sucessful, press Enter to continue...")
             print(f"subtask {subtask_name} processed successful, time taken: {time.time() - start_time}")
-        print(f"tissue {tissue_indices[idx]} processed successful, time taken: {time.time() - start_time}")
+        print(f"tissue {idx} processed successful, time taken: {time.time() - start_time}")
     total_num_episodes = dataset.num_episodes
     return dataset, total_num_episodes
 
@@ -385,7 +385,7 @@ def process_all_suturing_episodes(base_dir: str, num_chole_episodes: int, repo_i
             dataset.save_episode(task=subtask_prompt)
 
         print(f"subtask {subtask_name} processed successful, time taken: {time.time() - start_time}")
-    print(f"tissue {tissue_indices[idx]} processed successful, time taken: {time.time() - start_time}")
+    print(f"suturing processed successful, time taken: {time.time() - start_time}")
 
 
 def create_dataset(
