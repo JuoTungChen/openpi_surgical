@@ -90,43 +90,110 @@ class DvrkInputs(transforms.DataTransformFn):
         }
 
         # print(data["action"])
+        # if 'actions' in data:
+        #     qpos_psm1 = data["state"][:8]
+        #     qpos_psm2 = data["state"][8:]
+
+        #     action_psm1 = data["action"][:, :8]
+        #     action_psm2 = data["action"][:, 8:]
+
+        #     diff_psm1 = None
+        #     diff_psm2 = None
+        #     # compute hybrid-relative actions. see: https://surgical-robot-transformer.github.io/
+        #     diff_psm1 = compute_diff_actions(qpos_psm1, action_psm1)
+        #     diff_psm2 = compute_diff_actions(qpos_psm2, action_psm2)
+
+        #     # stack the actions along column dim
+        #     diff_action = np.column_stack((diff_psm1, diff_psm2))
+
+        #     inputs["actions"] = transforms.pad_to_dim(diff_action, self.action_dim)
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+@dataclasses.dataclass(frozen=True)
+class DvrkInputs_6D(transforms.DataTransformFn):
+    """Inputs for the dvrk policy.
+
+    Expected inputs:
+    - images: dict[name, img] where img is [channel, height, width]. name must be in EXPECTED_CAMERAS.
+    - state: [16]
+    - actions: [action_horizon, 20]
+    """
+
+    # The action dimension of the model. Will be used to pad state and actions.
+    action_dim: int
+
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    # the space used by the pi internal runtime which was used to train the base model.
+    adapt_to_pi: bool = False
+
+    # The expected cameras names. All input cameras must be in this set. Missing cameras will be
+    # replaced with black images and the corresponding `image_mask` will be set to False.
+    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("left", "right", "endo_psm1", "endo_psm2")
+
+    def __call__(self, data: dict) -> dict:
+        data = _decode_dvrk(data, adapt_to_pi=self.adapt_to_pi)
+
+        # Get the state. We are padding from 14 to the model action dim.
+        state = transforms.pad_to_dim(np.zeros_like(data["state"]), self.action_dim)
+        #state = transforms.pad_to_dim(data["state"], self.action_dim)
+
+        in_images = data["images"]
+        if set(in_images) - set(self.EXPECTED_CAMERAS):
+            raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
+
+        # Assume that base image always exists.
+        base_image = in_images["left"]
+
+        images = {
+            "base_0_rgb": base_image,
+        }
+        image_masks = {
+            "base_0_rgb": np.True_,
+        }
+        # Add the extra images.
+        extra_image_names = {
+            "left_wrist_0_rgb": "endo_psm2",
+            "right_wrist_0_rgb": "endo_psm1",
+        }
+        for dest, source in extra_image_names.items():
+            if source in in_images:
+                images[dest] = in_images[source]
+                image_masks[dest] = np.True_
+            else:
+                images[dest] = np.zeros_like(base_image)
+                image_masks[dest] = np.False_
+
+        inputs = {
+            "image": images,
+            "image_mask": image_masks,
+            "state": state,
+        }
         if 'actions' in data:
             qpos_psm1 = data["state"][:8]
             qpos_psm2 = data["state"][8:]
-
-            action_psm1 = data["action"][:, :8]
-            action_psm2 = data["action"][:, 8:]
-            # print("qpos_psm1: ", qpos_psm1)
-            # print("qpos_psm2: ", qpos_psm2)
-            # print("action_psm1: ", action_psm1.shape)
-            # print("action_psm2: ", action_psm2.shape)
+            action_psm1 = data["actions"][:, :8]
+            action_psm2 = data["actions"][:, 8:]
 
             diff_psm1 = None
             diff_psm2 = None
             # compute hybrid-relative actions. see: https://surgical-robot-transformer.github.io/
-            diff_psm1 = return_actions(qpos_psm1, action_psm1)
-            diff_psm2 = return_actions(qpos_psm2, action_psm2)
+            diff_psm1 = compute_diff_actions_6d(qpos_psm1, action_psm1)
+            diff_psm2 = compute_diff_actions_6d(qpos_psm2, action_psm2)
 
             # stack the actions along column dim
             diff_action = np.column_stack((diff_psm1, diff_psm2))
 
-            # print("diff_action: ", diff_action.shape)
-            # print("diff_action: ", diff_action)
-
-        # # Actions are only available during training.
-        # if "actions" in data:
-            # actions = np.asarray(data["actions"])
-            # actions = _encode_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
             inputs["actions"] = transforms.pad_to_dim(diff_action, self.action_dim)
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
-        # input("Press Enter to continue...")
-
 
         return inputs
-
 
 @dataclasses.dataclass(frozen=True)
 class DvrkInputs_NoStates(transforms.DataTransformFn):
@@ -199,8 +266,8 @@ class DvrkInputs_NoStates(transforms.DataTransformFn):
             diff_psm1 = None
             diff_psm2 = None
             # compute hybrid-relative actions. see: https://surgical-robot-transformer.github.io/
-            diff_psm1 = return_actions(qpos_psm1, action_psm1)
-            diff_psm2 = return_actions(qpos_psm2, action_psm2)
+            diff_psm1 = compute_diff_actions(qpos_psm1, action_psm1)
+            diff_psm2 = compute_diff_actions(qpos_psm2, action_psm2)
 
             # stack the actions along column dim
             diff_action = np.column_stack((diff_psm1, diff_psm2))
@@ -210,7 +277,6 @@ class DvrkInputs_NoStates(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
-        # input("Press Enter to continue...")
 
 
         return inputs
@@ -228,6 +294,18 @@ class DvrkOutputs(transforms.DataTransformFn):
         actions = np.asarray(data["actions"][:, :14])
         return {"actions": actions}
 
+
+@dataclasses.dataclass(frozen=True)
+class DvrkOutputs_6d(transforms.DataTransformFn):
+    """Outputs for the Aloha policy."""
+
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    # the space used by the pi internal runtime which was used to train the base model.
+
+    def __call__(self, data: dict) -> dict:
+        # Only return the first 20 dims.
+        actions = np.asarray(data["actions"][:, :20])
+        return {"actions": actions}
 
 def _joint_flip_mask() -> np.ndarray:
     """Used to convert between aloha and pi joint angles."""
@@ -388,6 +466,49 @@ def compute_diff_actions(qpos, action):
     delta_action[:, 6] = jaw_angle                 # Jaw angle (not relative)
 
     return delta_action
+
+def compute_diff_actions_6d(qpos, action):
+    """
+    Computes the relative actions with respect to the current position using axis-angle rotation.
+
+    Parameters:
+    - qpos: Current pose (array of shape [8] - xyz, xyzw, jaw angle)
+    - action: Actions commanded by the user (array of shape [n_actions x 8] - xyz, xyzw, jaw angle)
+
+    Returns:
+    - diff_expand: Relative actions with delta translation and delta rotation in axis-angle format.
+                Shape: (n_actions, 7) - [delta_translation, delta_rotation, jaw_angle]
+    """
+    # Compute the delta translation w.r.t da vinci endoscope tip frame (approx the camera frame)
+    delta_translation = action[:, 0:3] - qpos[0:3]  # Shape: (n_actions, 3)
+
+    # Extract quaternions from qpos and action
+    quat_init = qpos[3:7]          # Shape: (4,)
+    quat_actions = action[:, 3:7]  # Shape: (n_actions, 4)
+
+    # Convert quaternions to Rotation objects
+    r_init = R.from_quat(quat_init)
+    r_actions = R.from_quat(quat_actions)
+
+    # Compute the relative rotations
+    diff_rs = r_init.inv() * r_actions  # Shape: (n_actions,)
+
+    diff_6d = diff_rs.as_matrix()[:,:,:2]
+    diff_6d = diff_6d.transpose(0,2,1).reshape(-1, 6) # first column then second column
+
+    # Extract the jaw angle from the action (note: jaw angle is not relative)
+    jaw_angle = action[:, -1]  # Shape: (n_actions,)
+
+    # Prepare the final diff array
+    delta_action = np.zeros((action.shape[0], 10))  # Shape: (n_actions, 7)
+
+    # Populate the diff_expand array
+    delta_action[:, 0:3] = delta_translation       # Delta translation
+    delta_action[:, 3:9] = diff_6d                 # Delta rotation (axis-angle)
+    delta_action[:, -1] = jaw_angle                # Jaw angle (not relative)
+
+    return delta_action
+
 
 def normalize_actions(diffs):
     """
