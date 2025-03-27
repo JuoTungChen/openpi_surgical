@@ -10,6 +10,10 @@ import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
+from torch.utils.data import Sampler, DataLoader
+import random
+from collections import defaultdict
+
 import openpi.models.model as _model
 import openpi.training.config as _config
 import openpi.transforms as _transforms
@@ -155,15 +159,31 @@ def create_data_loader(
     dataset = create_dataset(data_config, config.model)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    data_loader = TorchDataLoader(
-        dataset,
-        local_batch_size=config.batch_size // jax.process_count(),
-        sharding=sharding,
-        shuffle=shuffle,
-        num_batches=num_batches,
-        num_workers=num_workers,
-        seed=config.seed,
-    )
+    if config.balance_data:
+        print("using task-balanced sampler")
+        # Use task-balanced sampler instead of random shuffling
+        sampler = TaskBalancedSampler(dataset, config.batch_size // jax.process_count())
+
+        data_loader = TorchDataLoader(
+            dataset,
+            local_batch_size=config.batch_size // jax.process_count(),
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            num_workers=num_workers,
+            seed=config.seed,
+            sampler=sampler,  # Use custom sampler
+        )
+    else:
+        data_loader = TorchDataLoader(
+            dataset,
+            local_batch_size=config.batch_size // jax.process_count(),
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            num_workers=num_workers,
+            seed=config.seed,
+        )
 
     class DataLoaderImpl(DataLoader):
         def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader):
@@ -254,6 +274,42 @@ class TorchDataLoader:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+
+
+
+class TaskBalancedSampler(Sampler):
+    def __init__(self, dataset, batch_size):
+        self.batch_size = batch_size
+        self.task_to_indices = defaultdict(list)
+        
+        # Group dataset indices by task
+        for idx, sample in enumerate(dataset):
+            task_index = sample["task_index"]  # Assuming each sample has 'task_index'
+            self.task_to_indices[task_index].append(idx)
+
+        self.task_list = list(self.task_to_indices.keys())
+        self.num_tasks = len(self.task_list)
+    
+    def __iter__(self):
+        batch = []
+        while True:
+            # Ensure each batch has at least one sample per task
+            task_samples = []
+            for task in self.task_list:
+                if self.task_to_indices[task]:  # Ensure task has available samples
+                    task_samples.append(random.choice(self.task_to_indices[task]))
+            
+            # Shuffle within the batch
+            random.shuffle(task_samples)
+            batch.extend(task_samples)
+
+            # Yield full batch
+            if len(batch) >= self.batch_size:
+                yield batch[:self.batch_size]
+                batch = batch[self.batch_size:]
+
+    def __len__(self):
+        return len(self.task_list)
 
 
 def _collate_fn(items):
