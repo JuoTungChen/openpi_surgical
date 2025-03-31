@@ -203,11 +203,11 @@ class DataAugImages(DataTransformFn):
 
     def __post_init__(self):
         # Use object.__setattr__ to set fields in frozen dataclass
-        object.__setattr__(self, 'resize', transforms.Resize(self.img_hw, antialias=True))
+        # object.__setattr__(self, 'resize', transforms.Resize(self.img_hw, antialias=True))
         object.__setattr__(self, 'random_crop', transforms.RandomCrop(size=[int(self.img_hw[0] * self.ratio),
                                                                           int(self.img_hw[1] * self.ratio)]))
         object.__setattr__(self, 'random_rot', transforms.RandomRotation(degrees=[-5.0, 5.0], expand=False))
-        object.__setattr__(self, 'composed', transforms.Compose([self.resize,
+        object.__setattr__(self, 'composed', transforms.Compose([#self.resize,
                                                                  self.random_crop,
                                                                  self.random_rot]))
         object.__setattr__(self, 'color_jitter', transforms.ColorJitter(brightness=0.2, contrast=0.4, 
@@ -235,10 +235,14 @@ class DataAugImages(DataTransformFn):
             return data
 
         for key, img in data["image"].items():
-            print(key)
             # Convert JAX array to numpy array
             img = np.array(img)
-            
+
+            ## if img is (H,W,C) convert to (B,H,W,C)
+            if len(img.shape) == 3:
+                # print("Converting to (B,H,W,C)")
+                img = np.expand_dims(img, axis=0)
+
             # Convert from (B,H,W,C) to (B,C,H,W) 
             img = torch.from_numpy(img).permute(0, 3, 1, 2)
             
@@ -274,7 +278,8 @@ class DataAugImages(DataTransformFn):
                 
             img = np.stack(transformed_imgs)
             
-            data["image"][key] = img
+            data["image"][key] = img.squeeze(0)
+            # print(data["image"][key].shape)
 
         return data
 
@@ -343,7 +348,8 @@ class TokenizePrompt(DataTransformFn):
             prompt = prompt.item()
 
         tokens, token_masks = self.tokenizer.tokenize(prompt)
-        return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+        return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks,}
+        # return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks, "prompt": prompt}
 
 
 @dataclasses.dataclass(frozen=True)
