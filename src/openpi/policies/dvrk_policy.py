@@ -94,8 +94,8 @@ class DvrkInputs(transforms.DataTransformFn):
             qpos_psm1 = data["state"][:8]
             qpos_psm2 = data["state"][8:]
 
-            action_psm1 = data["action"][:, :8]
-            action_psm2 = data["action"][:, 8:]
+            action_psm1 = data["actions"][:, :8]
+            action_psm2 = data["actions"][:, 8:]
 
             diff_psm1 = None
             diff_psm2 = None
@@ -260,8 +260,8 @@ class DvrkInputs_NoStates(transforms.DataTransformFn):
             qpos_psm1 = data["state"][:8]
             qpos_psm2 = data["state"][8:]
 
-            action_psm1 = data["action"][:, :8]
-            action_psm2 = data["action"][:, 8:]
+            action_psm1 = data["actions"][:, :8]
+            action_psm2 = data["actions"][:, 8:]
 
             diff_psm1 = None
             diff_psm2 = None
@@ -435,8 +435,8 @@ def compute_diff_actions(qpos, action):
                 Shape: (n_actions, 7) - [delta_translation, delta_rotation, jaw_angle]
     """
     
-    print("qpos: ", qpos)
-    print("action: ", action)
+    # print("qpos: ", qpos)
+    # print("action: ", action)
     # Compute the delta translation w.r.t da vinci endoscope tip frame (approx the camera frame)
     delta_translation = action[:, 0:3] - qpos[0:3]  # Shape: (n_actions, 3)
 
