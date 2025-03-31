@@ -1,4 +1,5 @@
 import dataclasses
+import etils.epath as epath
 
 import jax
 
@@ -6,6 +7,7 @@ from openpi.models import pi0
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 import openpi.transforms as _transforms
+import openpi.training.sharding as sharding
 
 
 def test_torch_data_loader():
@@ -162,4 +164,66 @@ def test_data_aug_transforms():
     axes[1,2].set_title("Augmented right wrist")
     plt.tight_layout()
     plt.savefig("data_aug_test.png")
+    plt.close()
+
+def test_train_data_aug():
+
+    # Load data from dvrk dataset
+    config = _config.get_config("dvrk_suturing_test")
+    jax.config.update("jax_threefry_partitionable", True)  # noqa: FBT003
+    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+
+    rng = jax.random.key(config.seed)
+    train_rng, init_rng = jax.random.split(rng)
+
+    mesh = sharding.make_mesh(config.fsdp_devices)
+    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
+
+    data_loader = _data_loader.create_data_loader(
+        config,
+        sharding=data_sharding,
+        num_workers=config.num_workers,
+        shuffle=True if not config.balance_data else False,
+    )
+    # batch = next(iter(data_loader))
+
+    # num_frames = len(data_loader)
+    # print(f"Computing stats for {num_frames} frames")
+    data_iter = iter(data_loader)
+    batch = next(data_iter)
+    print("finish batch")
+    observation, actions = batch  # Unpacking the tuple
+    # print(observation.prompt)
+    test_img_left = observation.images["base_0_rgb"]
+    test_img_lw = observation.images["left_wrist_0_rgb"]
+    test_img_rw = observation.images["right_wrist_0_rgb"]
+
+    test_img_left = (test_img_left + 1) / 2
+    test_img_lw = (test_img_lw + 1) / 2
+    test_img_rw = (test_img_rw + 1) / 2
+
+    # Visualize results
+    import matplotlib.pyplot as plt
+    
+    fig, axes = plt.subplots(1, 3, figsize=(15, 15))
+    axes[0].imshow(test_img_left[1])
+    axes[0].set_title("Left")
+    axes[1].imshow(test_img_lw[1])
+    axes[1].set_title("left wrist")
+    axes[2].imshow(test_img_rw[1])
+    axes[2].set_title("right wrist")
+    plt.tight_layout()
+    plt.savefig("data_aug_test.png")
+    plt.close()
+
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 15))
+    axes[0].imshow(test_img_left[2])
+    axes[0].set_title("Left")
+    axes[1].imshow(test_img_lw[2])
+    axes[1].set_title("left wrist")
+    axes[2].imshow(test_img_rw[2])
+    axes[2].set_title("right wrist")
+    plt.tight_layout()
+    plt.savefig("data_aug_test_1.png")
     plt.close()
