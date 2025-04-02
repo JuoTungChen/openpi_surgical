@@ -136,9 +136,7 @@ def process_episode(dataset, episode_path, states_name, actions_name):
         dtype=[(col, df[col].dtype.str) for col in df.columns]
     )
     print(episode_path)
-    # print(kinematics_data.dtype.names)
-    # print(kinematics_data["psm1_pose.position.x"])
-    # print(kinematics_data["psm1_pose.position.x"][0])
+
 
     for i in range(num_frames):
         frame = {
@@ -149,8 +147,6 @@ def process_episode(dataset, episode_path, states_name, actions_name):
                 kinematics_data[n][i] for n in actions_name
             ]),
         }
-        # print("state", frame["observation.state"])
-        # print("action", frame["action"])
 
         for cam_name, images in [('left', left_images), ('right', right_images), ('endo_psm1', psm1_images), ('endo_psm2', psm2_images)]:
             if images.size > 0:
@@ -160,37 +156,8 @@ def process_episode(dataset, episode_path, states_name, actions_name):
 
     return dataset
 
-    # # Create Zarr store
-    # relative_path = os.path.relpath(episode_path)
-    # zarr_path = os.path.join(output_base_dir, relative_path + '.zarr')
-    # os.makedirs(os.path.dirname(zarr_path), exist_ok=True)
-    # zarr_store = zarr.open_group(zarr_path, mode='w')
 
-    # # Set up compressor
-    # compressor = JpegCodec(quality=90)
-
-    # # Store images
-    # for cam_name, images in [('left', left_images), ('right', right_images),
-    #                          ('endo_psm1', psm1_images), ('endo_psm2', psm2_images)]:
-    #     if images.size > 0:
-    #         image_store = zarr_store.create_dataset(
-    #             cam_name,
-    #             shape=images.shape,
-    #             chunks=(1, images.shape[1], images.shape[2], images.shape[3]),
-    #             dtype='uint8',
-    #             compressor=compressor
-    #         )
-    #         image_store[:] = images
-
-    # # Store kinematics data as structured array
-    # zarr_store.create_dataset(
-    #     'kinematics',
-    #     data=kinematics_data,
-    #     dtype=kinematics_data.dtype
-    # )
-
-
-def process_all_episodes(base_dir: str, idx: int, tissue_indices: List[int], repo_id: str):
+def process_all_suturing_episodes(base_dir: str, repo_id: str):
     """Processes all episodes for given tissue indices using multiprocessing."""
 
 
@@ -199,7 +166,6 @@ def process_all_episodes(base_dir: str, idx: int, tissue_indices: List[int], rep
     #    shutil.rmtree(LEROBOT_HOME / repo_id)
 
 
-    episode_paths = []
     states_name = [
         "psm1_pose.position.x",
         "psm1_pose.position.y",
@@ -252,6 +218,7 @@ def process_all_episodes(base_dir: str, idx: int, tissue_indices: List[int], rep
             mode="image",
             dataset_config=DEFAULT_DATASET_CONFIG,
         )
+        num_episodes = 0
     else:
         # print(f"Resuming conversion. Existing dataset found at {dataset_path}")
         dataset = create_dataset(
@@ -266,51 +233,43 @@ def process_all_episodes(base_dir: str, idx: int, tissue_indices: List[int], rep
         print(f"Resuming conversion. Existing dataset found at {dataset_path} with {num_episodes} episodes")
 
 
-    # input("dataset created successful, press Enter to continue...")
-
     # measure time taken to complete the process
     start_time = time.time()
-
-    # for tissue_idx in tissue_indices:
-    tissue_dir = os.path.join(base_dir, f'tissue_{tissue_indices[idx]}')
+    count = 0
+    idx = 1
+    tissue_dir = os.path.join(base_dir, f'tissue_{idx}')
     if not os.path.exists(tissue_dir):
         print(f"Warning: {tissue_dir} does not exist.")
         exit()
-        # continue
-    count = 0
+
     for subtask_name in os.listdir(tissue_dir):
         subtask_dir = os.path.join(tissue_dir, subtask_name)
         if not os.path.isdir(subtask_dir):
             continue
 
+        ## use the directory name as the subtask prompt
+        subtask_prompt = " ".join(subtask_name.split("_")[1:])
+
+        ## TODO: use LLM to generate subtask prompts instead for better semantic generalization
+
+        ## remove "recovery" from the subtask name
+        if subtask_prompt.endswith("recovery"):
+            subtask_prompt = subtask_prompt[:-9]
+        
         for episode_name in os.listdir(subtask_dir):
             episode_dir = os.path.join(subtask_dir, episode_name)
             if not os.path.isdir(episode_dir):
                 continue
+            ## skip episodes that have already been processed
             if count < num_episodes:
                 count += 1
                 print(f"Skipping episode {episode_dir}")
                 continue
             dataset = process_episode(dataset, episode_dir, states_name, actions_name)
-            # input("episode processed successful, press Enter to continue...")
 
-            # Collect the episode path and output directory
-            # episode_paths.append((episode_dir, output_base_dir))
+            dataset.save_episode(task=subtask_prompt)
 
-            dataset.save_episode(task=subtask_name)
-
-        # input("subtask processed sucessful, press Enter to continue...")
         print(f"subtask {subtask_name} processed successful, time taken: {time.time() - start_time}")
-    print(f"tissue {tissue_indices[idx]} processed successful, time taken: {time.time() - start_time}")
-    dataset.consolidate()
-
-    # Determine the number of processes to use
-    # num_processes = min(cpu_count() - 15, len(episode_paths))
-    # print(f"Processing {len(episode_paths)} episodes with {num_processes} processes.")
-
-    # # Use multiprocessing Pool to process episodes in parallel
-    # with Pool(processes=num_processes) as pool:
-    #     pool.map(process_episode, episode_paths)
 
 
 def create_dataset(
@@ -440,14 +399,8 @@ def create_empty_dataset(
 
 
 if __name__ == "__main__":
-    # tyro.cli(main)
-    # base_dir = '.'  # Current directory
-    # output_base_dir = './processed_data'  # New folder for Zarr files
-    base_dir = "/home/iulian/chole_ws/data/Jesse"  # Name of the output dataset, also used for the Hugging Face Hub
-    output_base_dir = "/home/iulian/chole_ws/data/suturing_lerobot"  # Name of the output dataset, also used for the Hugging Face Hub
+
+    suturing_base_dir = "/path/to/data"  # Suturing data directory
     repo_id = "suturing_lerobot"  # Name of the output dataset, also used for the Hugging Face Hub
-    tissue_indices = [1, 2, 4, 5, 6, 8, 12, 13, 14, 18, 19, 22, 23, 30, 32, 35, 39, 40, 41, 47, 49, 50, 53, 54, 71, 72, 73, 75, 77, 80]  # Replace with your list of indices
-    idx = 0
-
-    process_all_episodes(base_dir, idx, tissue_indices, repo_id)
-
+    dataset = process_all_suturing_episodes(suturing_base_dir, repo_id)
+    # dataset.consolidate()
