@@ -1,4 +1,4 @@
-from rostopics import ros_topics
+from dvrk_scripts.rostopics import ros_topics
 import rospy
 import time
 
@@ -281,18 +281,18 @@ class example_application:
         
         self.arm.servo_cp(goal)
             
-        print("move cp complete")
+        # print("move cp complete")
         
         # if abs(jaw_diff) > jaw_diff_thres:
         #     print("open jaw")
-        #     self.arm.jaw.open(angle = wp[-1]).wait() # reach gripper angle
+        # self.arm.jaw.open(angle = wp[-1]).wait() # reach gripper angle
         
         # else:
-        print("servo jaw")
+        # print("servo jaw")
         
         jaw_position[0] = wp[-1]
         self.arm.jaw.servo_jp(jaw_position)
-        print("jaw open complete")
+        # print("jaw open complete")
         
 
     def move_robot_in_direction(self, direction):

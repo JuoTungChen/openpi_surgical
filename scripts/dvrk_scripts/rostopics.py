@@ -30,9 +30,9 @@ class ros_topics:
                                             CompressedImage, self.get_camera_image_right)
     
     # endoscope imgs
-    self.endo_cam_psm1_sub = rospy.Subscriber("/PSM2/endoscope_img", 
+    self.endo_cam_psm1_sub = rospy.Subscriber("/PSM1/endoscope_img", 
                                             Image, self.get_endo_cam_psm1)
-    self.endo_cam_psm2_sub = rospy.Subscriber("/PSM1/endoscope_img", 
+    self.endo_cam_psm2_sub = rospy.Subscriber("/PSM2/endoscope_img", 
                                             Image, self.get_endo_cam_psm2)
 
     #psm1

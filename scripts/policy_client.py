@@ -64,7 +64,6 @@ class Args:
     num_steps: int = 10
 
 
-
 class LowLevelPolicy:
 
     ## ----------------- initializations ----------------
@@ -87,7 +86,8 @@ class LowLevelPolicy:
         
     def initialize_parameters(self):
         self.num_inferences = 4000
-        self.action_execution_horizon = 10
+        self.action_execution_horizon = 18
+        self.chunk_size = 50
         
         self.sleep_rate = 0.18
         self.language_encoder = "distilbert"
@@ -104,9 +104,11 @@ class LowLevelPolicy:
         self.is_correction = False
         self.user_correction_start_t = None
         self.use_preprogrammed_correction = False
-        
+        self.rot_6d = True
+        # self.rot_6d = False
 
     def initialize_ros(self):
+        self.language_instruction = None
         self.rt = ros_topics()
         self.ral = crtk.ral('dvrk_arm_test')
         self.bridge = CvBridge()
@@ -121,12 +123,15 @@ class LowLevelPolicy:
         self.contour_image_sub = rospy.Subscriber('/yolo_contour_image', Image, self.contour_image_callback, queue_size=10)
         self.use_contour_image_sub = rospy.Subscriber('/use_contour_image', Bool, self.use_contour_image_callback, queue_size=10)
         self.robot_direction_correction_sub = rospy.Subscriber("/direction_instruction", String, self.robot_direction_callback, queue_size=1)
+        # self.start_record_sub = rospy.Subscriber('/start_recording', Bool, self.record_callback,  queue_size=10)
+        
         rospy.Subscriber('/is_correction', Bool, self.is_correction_callback, queue_size=1)
         rospy.Subscriber('/direction_instruction_user', String, self.user_correction_callback, queue_size=1)
         rospy.Subscriber("/use_preprogrammed_correction", Bool, self.use_preprogrammed_correction_callback)
         
         #     ## --------------------- callbacks -----------------------
     def language_instruction_callback(self, msg):
+        print("instruction:", msg.data)
         self.language_instruction = msg.data
 
     def embeddings_callback(self, msg):
@@ -209,6 +214,11 @@ class LowLevelPolicy:
                 # Send 1 observation to make sure the model is loaded.
                 action_chunk = self.policy.infer(self.obs_fn())
                 action = action_chunk["actions"]
+                # print(action.shape)
+                # input("Press Enter to continue...")
+                # print(action)
+                # input("Press Enter to continue...")
+                
                 # action = self.unnormalize_action(action, self.task_config['norm_scheme'])
 
 
@@ -221,17 +231,23 @@ class LowLevelPolicy:
                                     self.rt.psm2_jaw))
 
                 actions_psm1 = np.zeros((self.chunk_size, 8)) # pos, quat, jaw
-
-                actions_psm1[:, 0:3] = qpos_psm1[0:3] + action[:, 0:3] # convert to current translation
-                actions_psm1 = self.convert_delta_rotvec_to_taskspace_quat(action[:, 0:7], actions_psm1, qpos_psm1)
-        
-                actions_psm1[:, 7] = np.clip(action[:, 6], -0.698, 0.698)  # copy over gripper angles
-                
                 actions_psm2 = np.zeros((self.chunk_size, 8)) # pos, quat, jaw
-                actions_psm2[:, 0:3] = qpos_psm2[0:3] + action[:, 7:10] # convert to current translation
-                actions_psm2 = self.convert_delta_rotvec_to_taskspace_quat(action[:, 7:], actions_psm2, qpos_psm2)
-                actions_psm2[:, 7] = np.clip(action[:, 13], -0.698, 0.698)  # copy over gripper angles  
+
                 
+                if self.rot_6d == True:
+                    actions_psm1[:, 0:3] = qpos_psm1[0:3] + action[:, 0:3] # convert to current translation
+                    actions_psm1 = self.convert_delta_6d_to_taskspace_quat(action[:, 0:10], actions_psm1, qpos_psm1)
+                    actions_psm1[:, 7] = np.clip(action[:, 9], -0.698, 0.698)  # copy over gripper angles
+                    actions_psm2[:, 0:3] = qpos_psm2[0:3] + action[:, 10:13] # convert to current translation
+                    actions_psm2 = self.convert_delta_6d_to_taskspace_quat(action[:, 10:], actions_psm2, qpos_psm2)
+                    actions_psm2[:, 7] = np.clip(action[:, 19], -0.698, 0.698)  # copy over gripper angles  
+                else:
+                    actions_psm1[:, 0:3] = qpos_psm1[0:3] + action[:, 0:3] # convert to current translation
+                    actions_psm1 = self.convert_delta_rotvec_to_taskspace_quat(action[:, 0:7], actions_psm1, qpos_psm1)
+                    actions_psm1[:, 7] = np.clip(action[:, 6], -0.698, 0.698)  # copy over gripper angles
+                    actions_psm2[:, 0:3] = qpos_psm2[0:3] + action[:, 7:10] # convert to current translation
+                    actions_psm2 = self.convert_delta_rotvec_to_taskspace_quat(action[:, 7:], actions_psm2, qpos_psm2)
+                    actions_psm2[:, 7] = np.clip(action[:, 13], -0.698, 0.698)  # copy over gripper angles  
                         
                 # print("actions_psm1: ", actions_psm1, "\nactions_psm2: ", actions_psm2)
                 # Send actions to the robot (assume methods are implemented)
@@ -254,48 +270,25 @@ class LowLevelPolicy:
         # print(f"Average inference time: {1000 * (end - start) / args.num_steps:.2f} ms")
 
 
-    # def compute_diff_actions(qpos, action):
-    #     """
-    #     Computes the relative actions with respect to the current position using axis-angle rotation.
-
-    #     Parameters:
-    #     - qpos: Current pose (array of shape [8] - xyz, xyzw, jaw angle)
-    #     - action: Actions commanded by the user (array of shape [n_actions x 8] - xyz, xyzw, jaw angle)
-
-    #     Returns:
-    #     - diff_expand: Relative actions with delta translation and delta rotation in axis-angle format.
-    #                 Shape: (n_actions, 7) - [delta_translation, delta_rotation, jaw_angle]
-    #     """
-    #     # Compute the delta translation w.r.t da vinci endoscope tip frame (approx the camera frame)
-    #     delta_translation = action[:, 0:3] - qpos[0:3]  # Shape: (n_actions, 3)
-
-    #     # Extract quaternions from qpos and action
-    #     quat_init = qpos[3:7]          # Shape: (4,)
-    #     quat_actions = action[:, 3:7]  # Shape: (n_actions, 4)
-
-    #     # Convert quaternions to Rotation objects
-    #     r_init = R.from_quat(quat_init)
-    #     r_actions = R.from_quat(quat_actions)
-
-    #     # Compute the relative rotations
-    #     diff_rs = r_init.inv() * r_actions  # Shape: (n_actions,)
-
-    #     # Convert the rotation differences to rotation vectors (axis-angle representation)
-    #     delta_rotation = diff_rs.as_rotvec()  # Shape: (n_actions, 3)
-
-    #     # Extract the jaw angle from the action (note: jaw angle is not relative)
-    #     jaw_angle = action[:, -1]  # Shape: (n_actions,)
-
-    #     # Prepare the final diff array
-    #     delta_action = np.zeros((action.shape[0], 7))  # Shape: (n_actions, 7)
-
-    #     # Populate the diff_expand array
-    #     delta_action[:, 0:3] = delta_translation       # Delta translation
-    #     delta_action[:, 3:6] = delta_rotation          # Delta rotation (axis-angle)
-    #     delta_action[:, 6] = jaw_angle                 # Jaw angle (not relative)
-
-    #     return delta_action
-
+    def convert_delta_6d_to_taskspace_quat(self, all_actions, all_actions_converted, qpos):
+        '''
+        convert delta rot into task-space quaternion rot
+        '''
+        # Gram-schmidt
+        c1 = all_actions[:, 3:6] # t x 3
+        c2 = all_actions[:, 6:9] # t x 3 
+        c1 = normalize(c1, axis = 1) # t x 3
+        dot_product = np.sum(c1 * c2, axis = 1).reshape(-1, 1)
+        c2 = normalize(c2 - dot_product*c1, axis = 1)
+        c3 = np.cross(c1, c2)
+        r_mat = np.dstack((c1, c2, c3)) # t x 3 x 3
+        # transform delta rot into task space
+        rots = R.from_matrix(r_mat)
+        rot_init = R.from_quat(qpos[3:7])
+        rots = (rot_init * rots).as_quat()
+        all_actions_converted[:, 3:7] = rots
+        return all_actions_converted
+    
 
     def convert_delta_rotvec_to_taskspace_quat(self, all_actions, all_actions_converted, qpos):
         '''
@@ -324,19 +317,24 @@ class LowLevelPolicy:
         self.right_img = cv2.cvtColor(self.right_img, cv2.COLOR_BGR2RGB)
         self.right_img = rearrange(self.right_img, 'h w c -> c h w')
         
+        # plt.figure()
         lw_img = self.rt.endo_cam_psm2
-
         lw_img = cv2.resize(lw_img, (224, 224))
         lw_img = cv2.cvtColor(lw_img, cv2.COLOR_BGR2RGB)
+        # plt.imshow(lw_img)
+        # plt.show()
         lw_img = rearrange(lw_img, 'h w c -> c h w')
 
         rw_img = self.rt.endo_cam_psm1
+        
         rw_img = cv2.resize(rw_img, (224, 224))
         rw_img = cv2.cvtColor(rw_img, cv2.COLOR_BGR2RGB)
+        # plt.imshow(rw_img)
+        # plt.show()
         rw_img = rearrange(rw_img, 'h w c -> c h w')
         
-        
         return {
+            # "state": np.zeros((16)),  # Placeholder for state
             "state": np.array((self.rt.psm1_pose.position.x, self.rt.psm1_pose.position.y, self.rt.psm1_pose.position.z,
                             self.rt.psm1_pose.orientation.x, self.rt.psm1_pose.orientation.y, self.rt.psm1_pose.orientation.z, self.rt.psm1_pose.orientation.w,
                             self.rt.psm1_jaw,
@@ -345,11 +343,14 @@ class LowLevelPolicy:
                             self.rt.psm2_jaw)),
             "images": {
                 "left": self.left_img,
-                "right": self.right_img,
+                # "right": self.right_img,
+                ## TODO: change back
                 "endo_psm1": rw_img,
                 "endo_psm2": lw_img,
+                # "endo_psm1": lw_img,
+                # "endo_psm2": rw_img,
             },
-            "prompt": "1_needle_pickup",
+            "prompt": "2_needle_throw" if self.language_instruction is None else self.language_instruction,
         }
 
 
@@ -377,11 +378,15 @@ class LowLevelPolicy:
             
         for jj in range(self.action_execution_horizon):
 
-            self.ral.spin_and_execute(self.psm1_app.run_full_pose_goal, actions_psm1[jj])
-            self.ral.spin_and_execute(self.psm2_app.run_full_pose_goal, actions_psm2[jj])
-            time.sleep(self.sleep_rate)
+            if not self.pause:
 
-
+                self.ral.spin_and_execute(self.psm1_app.run_full_pose_goal, actions_psm1[jj])
+                self.ral.spin_and_execute(self.psm2_app.run_full_pose_goal, actions_psm2[jj])
+                time.sleep(self.sleep_rate)
+            else:
+                break
+            
+            
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     ll = LowLevelPolicy(Args)
