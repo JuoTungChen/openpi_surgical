@@ -17,7 +17,6 @@ from collections import defaultdict
 import openpi.models.model as _model
 import openpi.training.config as _config
 import openpi.transforms as _transforms
-from openpi.training.generic_dataset import EpisodicDatasetDvrkGeneric
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -49,8 +48,15 @@ class TransformedDataset(Dataset[T_co]):
         self._transform = _transforms.compose(transforms)
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        return self._transform(self._dataset[index])
+        # print(self._dataset[0])
+        original_sample = self._dataset[index]
+        transformed_sample = self._transform(original_sample)
 
+        # Ensure 'task_index' is preserved
+        transformed_sample["task_index"] = original_sample["task_index"]
+
+        return transformed_sample
+    
     def __len__(self) -> int:
         return len(self._dataset)
 
@@ -95,6 +101,7 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, local_files_only=data_config.local_files_only)
+    # print(dataset_meta.tasks)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
@@ -109,18 +116,6 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
 
     return dataset
 
-
-def create_dvrk_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig) -> Dataset:
-    """Create a dataset for training."""
-    repo_id = data_config.repo_id
-    if repo_id is None:
-        raise ValueError("Repo ID is not set. Cannot create dataset.")
-    if repo_id == "fake":
-        return FakeDataset(model_config, num_samples=1024)
-
-    dataset = EpisodicDatasetDvrkGeneric(repo_id)
-
-    return dataset
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
@@ -167,38 +162,32 @@ def create_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
     """
+
     data_config = config.data.create(config.assets_dirs, config.model)
-    dataset = create_dvrk_dataset(data_config, config.model)
-    # dataset = create_dataset(data_config, config.model)
-
-
+    dataset = create_dataset(data_config, config.model)
+    print("original", dataset[0].keys())
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    print("transformed", dataset[0].keys())
 
     if config.balance_data:
         print("using task-balanced sampler")
         # Use task-balanced sampler instead of random shuffling
-        sampler = TaskBalancedSampler(dataset, config.batch_size // jax.process_count())
 
-        data_loader = TorchDataLoader(
-            dataset,
-            local_batch_size=config.batch_size // jax.process_count(),
-            sharding=sharding,
-            shuffle=shuffle,
-            num_batches=num_batches,
-            num_workers=num_workers,
-            seed=config.seed,
-            sampler=sampler,  # Use custom sampler
-        )
-    else:
-        data_loader = TorchDataLoader(
-            dataset,
-            local_batch_size=config.batch_size // jax.process_count(),
-            sharding=sharding,
-            shuffle=shuffle,
-            num_batches=num_batches,
-            num_workers=num_workers,
-            seed=config.seed,
-        )
+    sampler = TaskBalancedSampler(dataset, config.batch_size // jax.process_count())
+
+
+    data_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=config.batch_size // jax.process_count(),
+        sharding=sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=config.seed,
+        sampler=sampler if config.balance_data else None,  # Use custom sampler
+        # sampler=None if config.balance_data else None,  # Use custom sampler
+    )
+   
 
     class DataLoaderImpl(DataLoader):
         def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader):
@@ -226,6 +215,7 @@ class TorchDataLoader:
         num_batches: int | None = None,
         num_workers: int = 0,
         seed: int = 0,
+        sampler: Sampler | None = None,
     ):
         """Create a PyTorch data loader.
 
@@ -262,6 +252,7 @@ class TorchDataLoader:
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
             batch_size=local_batch_size,
+            sampler=sampler,
             shuffle=shuffle,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
@@ -291,40 +282,76 @@ class TorchDataLoader:
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 
-
 class TaskBalancedSampler(Sampler):
     def __init__(self, dataset, batch_size):
+        self.dataset = dataset
         self.batch_size = batch_size
-        self.task_to_indices = defaultdict(list)
-        
-        # Group dataset indices by task
-        for idx, sample in enumerate(dataset):
-            task_index = sample["task_index"]  # Assuming each sample has 'task_index'
-            self.task_to_indices[task_index].append(idx)
+        self.total_samples = len(dataset)
 
-        self.task_list = list(self.task_to_indices.keys())
-        self.num_tasks = len(self.task_list)
-    
     def __iter__(self):
-        batch = []
-        while True:
-            # Ensure each batch has at least one sample per task
-            task_samples = []
-            for task in self.task_list:
-                if self.task_to_indices[task]:  # Ensure task has available samples
-                    task_samples.append(random.choice(self.task_to_indices[task]))
-            
-            # Shuffle within the batch
-            random.shuffle(task_samples)
-            batch.extend(task_samples)
+        indices = list(range(self.total_samples))
+        random.shuffle(indices)
 
-            # Yield full batch
-            if len(batch) >= self.batch_size:
-                yield batch[:self.batch_size]
-                batch = batch[self.batch_size:]
+        batch = []
+        seen_tasks = set()
+
+        for idx in indices:
+            sample = self.dataset[idx]
+            task_index = sample["task_index"]
+
+            # Ensure each batch has at least one of each task
+            if task_index not in seen_tasks or len(batch) < self.batch_size:
+                print(task_index, idx)
+                batch.append(idx)
+                seen_tasks.add(task_index)
+
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+                seen_tasks.clear()
+
+        # Yield remaining samples if any
+        if batch:
+            yield batch
 
     def __len__(self):
-        return len(self.task_list)
+        return self.total_samples // self.batch_size
+    
+# class TaskBalancedSampler(Sampler):
+#     def __init__(self, dataset, batch_size):
+#         self.batch_size = batch_size
+#         self.task_to_indices = defaultdict(list)
+        
+#         # Group dataset indices by task
+#         for idx, sample in enumerate(dataset):
+#             # print(sample.keys())
+#             task_index = sample["task_index"]  # Assuming each sample has 'task_index'
+#             # print(idx, task_index)
+#             self.task_to_indices[task_index].append(idx)
+
+#         self.task_list = list(self.task_to_indices.keys())
+#         self.num_tasks = len(self.task_list)
+    
+#     def __iter__(self):
+#         batch = []
+#         while True:
+#             # Ensure each batch has at least one sample per task
+#             task_samples = []
+#             for task in self.task_list:
+#                 if self.task_to_indices[task]:  # Ensure task has available samples
+#                     task_samples.append(random.choice(self.task_to_indices[task]))
+            
+#             # Shuffle within the batch
+#             random.shuffle(task_samples)
+#             batch.extend(task_samples)
+
+#             # Yield full batch
+#             if len(batch) >= self.batch_size:
+#                 yield batch[:self.batch_size]
+#                 batch = batch[self.batch_size:]
+
+#     def __len__(self):
+#         return len(self.task_list)
 
 
 def _collate_fn(items):

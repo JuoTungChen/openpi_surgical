@@ -110,8 +110,8 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.DataAugImages(img_hw=(224, 224), ratio=0.95, mask_prob=0.1),  # data augmentation
                         _transforms.ResizeImages(224, 224),
+                        _transforms.DataAugImages(img_hw=(224, 224), ratio=0.95, mask_prob=0.1),  # data augmentation
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -288,7 +288,6 @@ class LeRobotDvrkDataConfig(DataConfigFactory):
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
-
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
         return dataclasses.replace(
@@ -868,7 +867,7 @@ _CONFIGS = [
         name="dvrk_suturing_test",
         model=pi0.Pi0Config(),
         data=LeRobotDvrkDataConfig(
-            repo_id="suturing_lerobot_test",
+            repo_id="suturing_lerobot",
             assets=AssetsConfig(
                 assets_dir="/home/iulian/chole_ws/src/openpi/assets/dvrk_suturing_test",
                 asset_id="suturing_lerobot_test",
@@ -896,6 +895,42 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+        balance_data=True,
+    ),
+        TrainConfig(
+        name="dvrk_chole_test",
+        model=pi0.Pi0Config(),
+        data=LeRobotDvrkDataConfig(
+            repo_id=["/cis/home/sschmi46/chole_ws/data/base_chole_clipping_cutting/processed_data_zipped_pi/",
+                     "/cis/home/sschmi46/chole_ws/data/Jesse/processed_data_zipped_pi/"],
+            assets=AssetsConfig(
+                assets_dir="/cis/home/sschmi46/chole_ws/src/openpi_surgical/assets/dvrk_chole_suturing_fc_6d/",
+                asset_id="chole_suturing_lerobot",
+            ),
+            default_prompt="grabbing gallbladder",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "left": "observation.images.left",
+                                "right": "observation.images.right",
+                                "endo_psm1": "observation.images.endo_psm1",
+                                "endo_psm2": "observation.images.endo_psm2",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        balance_data=False,
     ),
 
 
