@@ -106,6 +106,7 @@ class LowLevelPolicy:
         self.use_preprogrammed_correction = False
         self.rot_6d = True
         # self.rot_6d = False
+        self.no_states = True
 
     def initialize_ros(self):
         self.language_instruction = None
@@ -332,25 +333,24 @@ class LowLevelPolicy:
         # plt.imshow(rw_img)
         # plt.show()
         rw_img = rearrange(rw_img, 'h w c -> c h w')
-        
-        return {
-            # "state": np.zeros((16)),  # Placeholder for state
-            "state": np.array((self.rt.psm1_pose.position.x, self.rt.psm1_pose.position.y, self.rt.psm1_pose.position.z,
+        if self.no_states:
+            state_result = np.zeros((16))
+        else:
+            state_result= np.array((self.rt.psm1_pose.position.x, self.rt.psm1_pose.position.y, self.rt.psm1_pose.position.z,
                             self.rt.psm1_pose.orientation.x, self.rt.psm1_pose.orientation.y, self.rt.psm1_pose.orientation.z, self.rt.psm1_pose.orientation.w,
                             self.rt.psm1_jaw,
                             self.rt.psm2_pose.position.x, self.rt.psm2_pose.position.y, self.rt.psm2_pose.position.z,
                             self.rt.psm2_pose.orientation.x, self.rt.psm2_pose.orientation.y, self.rt.psm2_pose.orientation.z, self.rt.psm2_pose.orientation.w,
-                            self.rt.psm2_jaw)),
+                            self.rt.psm2_jaw))
+        return {
+            "state": state_result,
             "images": {
                 "left": self.left_img,
-                # "right": self.right_img,
-                ## TODO: change back
                 "endo_psm1": rw_img,
                 "endo_psm2": lw_img,
-                # "endo_psm1": lw_img,
-                # "endo_psm2": rw_img,
             },
-            "prompt": "2_needle_throw" if self.language_instruction is None else self.language_instruction,
+            "prompt": "needle pickup" if self.language_instruction is None else self.language_instruction,
+            "actions_is_pad": np.full((self.chunk_size), False),
         }
 
 

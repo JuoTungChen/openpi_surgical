@@ -182,7 +182,7 @@ class DrawingWindow(QMainWindow):
         self.robot_paused = False  # Track the pause state
         self.hl_paused = False
         self.use_preprogrammed_correction = False
-
+        self.start_record = False
         self.pause_publisher = rospy.Publisher('/pause_robot', Bool, queue_size=10)
         self.pause_hl_publisher = rospy.Publisher('/pause_hl', Bool, queue_size=10)
         self.action_horizon_publisher = rospy.Publisher('/action_horizon', Int16, queue_size=10)
@@ -287,7 +287,8 @@ class DrawingWindow(QMainWindow):
         #     "needle pickup", "needle throw"
         #     ]
         
-        self.avail_commands = ["1_needle_pickup", "2_needle_throw",  ]
+        self.avail_commands = ["needle pickup", "needle throw"]
+        # self.avail_commands = ["1_needle_pickup", "2_needle_throw",  ]
         
         self.command_label = QLabel('Select Command:')
         self.command_combobox = QComboBox()
@@ -297,7 +298,10 @@ class DrawingWindow(QMainWindow):
         self.command_button = QPushButton('Send Command', self)
         self.command_button.clicked.connect(self.publish_instructor_prediction)
         button_layout.addWidget(self.command_button)
-        
+        ## add a button to start recording
+        self.recording_button = QPushButton('Start Recording', self)
+        self.recording_button.clicked.connect(self.start_recording_pub)
+        button_layout.addWidget(self.recording_button)     
         
         # self.correction_commands = get_all_auto_labels_list()
         # self.correction_label = QLabel('Select Command:')
@@ -429,16 +433,16 @@ class DrawingWindow(QMainWindow):
     def instructor_prediction_callback(self, msg):
         ## show the predictions on the GUI
         self.prediction = msg.data
-    def publish_speech_record(self):
-        msg = Bool()
-        if self.record_pressed:
-            self.record_pressed = False
-            msg.data = True    
-            self.start_record_pub.publish(msg)
-        else:
-            self.record_pressed = True
-            msg.data = False
-            self.start_record_pub.publish(msg)
+    # def publish_speech_record(self):
+    #     msg = Bool()
+    #     if self.record_pressed:
+    #         self.record_pressed = False
+    #         msg.data = True    
+    #         self.start_record_pub.publish(msg)
+    #     else:
+    #         self.record_pressed = True
+    #         msg.data = False
+    #         self.start_record_pub.publish(msg)
             
     def publish_use_contour(self):
         msg = Bool()
@@ -466,6 +470,16 @@ class DrawingWindow(QMainWindow):
         self.instructor_prediction_pub.publish(selected_command)
         
         print(f"Overwriting instruction prediction with {selected_command}")
+    
+    def start_recording_pub(self):
+        self.start_record = not self.start_record  # Toggle pause state
+        self.start_record_pub.publish(self.start_record)  # Publish the state
+        print(f"Recording state: {self.start_record}")
+        # Update button text based on state
+        if self.start_record:
+            self.recording_button.setText('Stop Recording')
+        else:
+            self.recording_button.setText('Start Recording')
     
     def publish_correction(self):
         selected_correction = self.correction_combobox.currentText()
@@ -838,10 +852,10 @@ class DrawingWindow(QMainWindow):
             self.toggle_annotation_mode(self.annotate_mode)
             self.update()  # Redraw the widget if needed
         
-        if event.key() == Qt.Key_R:
-            self.reset_sketch()  # Reset the sketch points
-            self.toggle_annotation_mode(False)
-            self.update()  # Redraw the widget if needed
+        # if event.key() == Qt.Key_R:
+        #     self.reset_sketch()  # Reset the sketch points
+        #     self.toggle_annotation_mode(False)
+        #     self.update()  # Redraw the widget if needed
             
         if event.key() == Qt.Key_P:
             self.toggle_robot_motion() 
