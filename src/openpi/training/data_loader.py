@@ -168,27 +168,50 @@ def create_data_loader(
             execute in the main process.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
+    print("asset_dirs:", config.assets_dirs)
     dataset = create_dvrk_dataset(data_config, config.model)
-    # dataset = create_dataset(data_config, config.model)
+    #dataset = create_dataset(data_config, config.model)
 
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
+    base_dataset = dataset._dataset if isinstance(dataset, TransformedDataset) else dataset
+
     if config.balance_data:
         print("using task-balanced sampler")
         # Use task-balanced sampler instead of random shuffling
-        sampler = TaskBalancedSampler(dataset, config.batch_size // jax.process_count())
+
+        # Check for tasks with no samples
+        empty_tasks = [k for k, v in base_dataset.task_to_indices.items() if len(v) == 0]
+        if empty_tasks:
+            raise ValueError(f"Tasks with no samples: {empty_tasks}")
+
+        # (Optional) Check if any task has fewer samples than desired
+        too_small = [k for k, v in base_dataset.task_to_indices.items() if len(v) < config.samples_per_task]
+        if too_small:
+            print(f" Warning: Tasks with < {config.samples_per_task} samples: {too_small}")
+            # Optionally adjust samples_per_task to the minimum
+            config.samples_per_task = min(len(v) for v in base_dataset.task_to_indices.values())
+
+
+        sampler = StratifiedBatchSampler(
+            task_to_indices=base_dataset.task_to_indices,
+            batch_size=config.batch_size,
+            # batch_size=num_tasks * samples_per_task,
+            samples_per_task=config.samples_per_task,
+            seed=config.seed,
+        )
 
         data_loader = TorchDataLoader(
             dataset,
             local_batch_size=config.batch_size // jax.process_count(),
             sharding=sharding,
-            shuffle=shuffle,
-            num_batches=num_batches,
+            #num_batches=num_batches,
             num_workers=num_workers,
             seed=config.seed,
-            sampler=sampler,  # Use custom sampler
+            batch_sampler=sampler,  # Use custom sampler
         )
+
     else:
         data_loader = TorchDataLoader(
             dataset,
@@ -221,6 +244,7 @@ class TorchDataLoader:
         dataset,
         local_batch_size: int,
         *,
+        batch_sampler: Sampler | None = None,
         sharding: jax.sharding.Sharding | None = None,
         shuffle: bool = False,
         num_batches: int | None = None,
@@ -259,18 +283,32 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
-        self._data_loader = torch.utils.data.DataLoader(
-            typing.cast(torch.utils.data.Dataset, dataset),
-            batch_size=local_batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            multiprocessing_context=mp_context,
-            persistent_workers=num_workers > 0,
-            collate_fn=_collate_fn,
-            worker_init_fn=_worker_init_fn,
-            drop_last=True,
-            generator=generator,
-        )
+        if batch_sampler:
+            self._data_loader = torch.utils.data.DataLoader(
+                typing.cast(torch.utils.data.Dataset, dataset),
+                num_workers=num_workers,
+                multiprocessing_context=mp_context,
+                persistent_workers=num_workers > 0,
+                collate_fn=_collate_fn,
+                worker_init_fn=_worker_init_fn,
+                generator=generator,
+                batch_sampler=batch_sampler
+            )
+            
+        else:
+            self._data_loader = torch.utils.data.DataLoader(
+                typing.cast(torch.utils.data.Dataset, dataset),
+                batch_size=local_batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                multiprocessing_context=mp_context,
+                persistent_workers=num_workers > 0,
+                collate_fn=_collate_fn,
+                worker_init_fn=_worker_init_fn,
+                drop_last=True,
+                generator=generator,
+                batch_sampler=batch_sampler
+            )
 
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:
@@ -292,39 +330,41 @@ class TorchDataLoader:
 
 
 
-class TaskBalancedSampler(Sampler):
-    def __init__(self, dataset, batch_size):
+class StratifiedBatchSampler(Sampler):
+    def __init__(self, task_to_indices, batch_size, samples_per_task=3, seed=0):
+        self.task_to_indices = task_to_indices
+        self.task_ids = list(task_to_indices.keys())
         self.batch_size = batch_size
-        self.task_to_indices = defaultdict(list)
-        
-        # Group dataset indices by task
-        for idx, sample in enumerate(dataset):
-            task_index = sample["task_index"]  # Assuming each sample has 'task_index'
-            self.task_to_indices[task_index].append(idx)
+        self.samples_per_task = samples_per_task
+        self.seed = seed
+        self.all_indices = [idx for indices in task_to_indices.values() for idx in indices]
 
-        self.task_list = list(self.task_to_indices.keys())
-        self.num_tasks = len(self.task_list)
-    
     def __iter__(self):
-        batch = []
-        while True:
-            # Ensure each batch has at least one sample per task
-            task_samples = []
-            for task in self.task_list:
-                if self.task_to_indices[task]:  # Ensure task has available samples
-                    task_samples.append(random.choice(self.task_to_indices[task]))
-            
-            # Shuffle within the batch
-            random.shuffle(task_samples)
-            batch.extend(task_samples)
+        random.seed(self.seed)
+        task_pools = {
+            task: random.sample(indices, len(indices))
+            for task, indices in self.task_to_indices.items()
+        }
 
-            # Yield full batch
-            if len(batch) >= self.batch_size:
-                yield batch[:self.batch_size]
-                batch = batch[self.batch_size:]
+        while True:
+            batch = []
+            # Sample at least `samples_per_task` from each task
+            for task in self.task_ids:
+                pool = task_pools[task]
+                if len(pool) < self.samples_per_task:
+                    raise ValueError(f"Not enough samples in task {task} to satisfy `samples_per_task`.")
+                batch.extend([pool.pop() for _ in range(self.samples_per_task)])
+
+            # Randomly sample the remaining samples to fill the batch
+            remaining_samples = self.batch_size - len(batch)
+            if remaining_samples > 0:
+                batch.extend(random.sample(self.all_indices, remaining_samples))
+
+            yield batch
 
     def __len__(self):
-        return len(self.task_list)
+        min_size = min(len(indices) for indices in self.task_to_indices.values())
+        return min_size // self.samples_per_task
 
 
 def _collate_fn(items):

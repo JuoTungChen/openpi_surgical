@@ -492,6 +492,7 @@ class TrainConfig:
 
     # If true, will balance the data loader, making sure that each batch has data from every task.
     balance_data: bool = False
+    samples_per_task: int = 1
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -862,6 +863,81 @@ _CONFIGS = [
         num_train_steps=100_000,
         fsdp_devices=2,
         batch_size=64,
+    ),
+    TrainConfig(
+        name="dvrk_chole_suturing_fc_6d",
+        model=pi0.Pi0Config(),
+        data=LeRobotDvrk6dDataConfig(
+            repo_id="chole_suturing_lerobot",
+            assets=AssetsConfig(
+                assets_dir="/home/iulian/chole_ws/src/openpi/assets/dvrk_suturing_fc_6d/",
+                asset_id="chole_suturing_lerobot",
+            ),
+            default_prompt="needle pickup",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "left": "observation.images.left",
+                                "endo_psm1": "observation.images.endo_psm1",
+                                "endo_psm2": "observation.images.endo_psm2",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        #weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100_000,
+        fsdp_devices=2,
+        batch_size=64,
+    ),
+    TrainConfig(
+        name="dvrk_chole_suturing_fc_6d_task_balanced",
+        model=pi0.Pi0Config(),
+        data=LeRobotDvrk6dDataConfig(
+            repo_id=["/cis/home/sschmi46/chole_ws/data/base_chole_clipping_cutting/processed_data_zipped_pi/",
+                     "/cis/home/sschmi46/chole_ws/data/Jesse/processed_data_zipped_pi/"],
+            assets=AssetsConfig(
+                assets_dir="/cis/home/sschmi46/chole_ws/src/openpi_surgical/assets/dvrk_chole_suturing_fc_6d/",
+                asset_id="chole_suturing_lerobot",
+            ),
+            default_prompt="needle pickup",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "left": "observation.images.left",
+                                "endo_psm1": "observation.images.endo_psm1",
+                                "endo_psm2": "observation.images.endo_psm2",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        #weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100_000,
+        fsdp_devices=4,
+        batch_size=64,
+        balance_data=True,
+        samples_per_task=3,
     ),
     TrainConfig(
         name="dvrk_suturing_test",
