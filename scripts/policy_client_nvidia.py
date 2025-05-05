@@ -9,6 +9,7 @@ from tqdm import tqdm
 from einops import rearrange
 import sys
 from std_msgs.msg import String, Float32MultiArray
+import pandas as pd
 
 
 # path_to_pi = "/home/grapes/catkin_ws/src/openpi_surgical"
@@ -57,11 +58,19 @@ class EnvMode(enum.Enum):
 class Args:
     #host: str = "0.0.0.0"
     #host: str = "127.0.0.1"
-    host: str = "10.162.34.150"
+    # host: str = "10.162.34.150"
+    host: str = "10.162.34.202"
     port: int = 8000
 
     env: EnvMode = EnvMode.DVRK
     num_steps: int = 10
+    use_stereo: bool = False
+    use_6d: bool = False
+    no_states: bool = False
+    skip_every: int = 1
+    
+    
+    
 
 
 class LowLevelPolicy:
@@ -69,12 +78,12 @@ class LowLevelPolicy:
     ## ----------------- initializations ----------------
     def __init__(self, args):
         
-        self.initialize_parameters()
+        self.initialize_parameters(args)
         
         self.initialize_ros()
         
         self.obs_fn = {
-            EnvMode.DVRK: self.get_observation_dvrk,
+            EnvMode.DVRK: self.get_observation_dvrk_stereo if self.stereo else self.get_observation_dvrk,
         }[args.env]
 
         self.policy = _websocket_client_policy.WebsocketClientPolicy(
@@ -84,9 +93,26 @@ class LowLevelPolicy:
         logging.info(f"Server metadata: {self.policy.get_server_metadata()}")
         
         
-    def initialize_parameters(self):
+    def initialize_parameters(self, args):
+        self.header_name_qpos_psm1 = ["psm1_pose.position.x", "psm1_pose.position.y", "psm1_pose.position.z",
+                                "psm1_pose.orientation.x", "psm1_pose.orientation.y", "psm1_pose.orientation.z", "psm1_pose.orientation.w",
+                                "psm1_jaw"]
+        
+        self.header_name_qpos_psm2 = ["psm2_pose.position.x", "psm2_pose.position.y", "psm2_pose.position.z",
+                                "psm2_pose.orientation.x", "psm2_pose.orientation.y", "psm2_pose.orientation.z", "psm2_pose.orientation.w",
+                                "psm2_jaw"]
+        
+        self.header_name_actions_prsm1 = ["psm1_sp.position.x", "psm1_sp.position.y", "psm1_sp.position.z",
+                                    "psm1_sp.orientation.x", "psm1_sp.orientation.y", "psm1_sp.orientation.z", "psm1_sp.orientation.w",
+                                    "psm1_jaw_sp"]
+
+        self.header_name_actions_psm2 = ["psm2_sp.position.x", "psm2_sp.position.y", "psm2_sp.position.z",
+                                    "psm2_sp.orientation.x", "psm2_sp.orientation.y", "psm2_sp.orientation.z", "psm2_sp.orientation.w",
+                                    "psm2_jaw_sp"]
+        
+        
         self.num_inferences = 4000
-        self.action_execution_horizon = 18
+        self.action_execution_horizon = 20
         self.chunk_size = 50
         
         self.sleep_rate = 0.15
@@ -103,10 +129,14 @@ class LowLevelPolicy:
         self.user_correction_start_t = None
         self.use_preprogrammed_correction = False
         # self.rot_6d = True
-        self.rot_6d = False
-        # self.no_states = True
-        self.no_states = False
-        self.stereo = True
+        self.get_img_from_dataset = False
+        self.rot_6d = args.use_6d
+        self.no_states = args.no_states
+        print(args.use_stereo)
+        self.stereo = args.use_stereo
+        self.skip_every = args.skip_every
+        # self.stereo = False
+
 
     def initialize_ros(self):
         self.language_instruction = None
@@ -171,7 +201,9 @@ class LowLevelPolicy:
                 qpos_psm2 = np.array((self.rt.psm2_pose.position.x, self.rt.psm2_pose.position.y, self.rt.psm2_pose.position.z,
                                     self.rt.psm2_pose.orientation.x, self.rt.psm2_pose.orientation.y, self.rt.psm2_pose.orientation.z, self.rt.psm2_pose.orientation.w,
                                     self.rt.psm2_jaw))
+                # qpos_psm1 = np.zeros((8))
 
+                # qpos_psm2 = np.zeros((8))
                 actions_psm1 = np.zeros((self.chunk_size, 8)) # pos, quat, jaw
                 actions_psm2 = np.zeros((self.chunk_size, 8)) # pos, quat, jaw
 
@@ -184,19 +216,23 @@ class LowLevelPolicy:
                     actions_psm2 = self.convert_delta_6d_to_taskspace_quat(action[:, 10:], actions_psm2, qpos_psm2)
                     actions_psm2[:, 7] = np.clip(action[:, 19], -0.698, 0.698)  # copy over gripper angles  
                 else:
-                    actions_psm1[:, 0:3] = qpos_psm1[0:3] + action[:, 0:3] # convert to current translation
+                    action_normalized = deepcopy(action)
+                    action_normalized[:, 0:3] -= action[0, 0:3]
+                    action_normalized[:, 7:10] -= action[0, 7:10]
+                    actions_psm1[:, 0:3] = qpos_psm1[0:3] + action_normalized[:, 0:3] # convert to current translation
                     actions_psm1 = self.convert_delta_rotvec_to_taskspace_quat(action[:, 0:7], actions_psm1, qpos_psm1)
                     actions_psm1[:, 7] = np.clip(action[:, 6], -0.698, 0.698)  # copy over gripper angles
-                    actions_psm2[:, 0:3] = qpos_psm2[0:3] + action[:, 7:10] # convert to current translation
+                    actions_psm2[:, 0:3] = qpos_psm2[0:3] + action_normalized[:, 7:10] # convert to current translation
                     actions_psm2 = self.convert_delta_rotvec_to_taskspace_quat(action[:, 7:], actions_psm2, qpos_psm2)
                     actions_psm2[:, 7] = np.clip(action[:, 13], -0.698, 0.698)  # copy over gripper angles  
                         
                 # print("actions_psm1: ", actions_psm1, "\nactions_psm2: ", actions_psm2)
                 # Send actions to the robot (assume methods are implemented)
-                # self.plot_actions(qpos_psm1, qpos_psm2, actions_psm1, actions_psm2)
+                # self.plot_actions_psm2( qpos_psm2, actions_psm2)
+
+                # self.plot_actions_comparison(actions_psm2, self.action_psm2_gt)
                 # if not self.is_correction:
                 self.execute_actions(actions_psm1, actions_psm2)
-                # self.execute_actions(actions_psm1, actions_psm2, actions_psm1_temp, actions_psm2_temp)
                 
                 t += 1
                 
@@ -245,12 +281,19 @@ class LowLevelPolicy:
         return all_actions_converted
 
     def get_observation_dvrk(self) -> dict:
-        get_img_from_dataset = False
-        if get_img_from_dataset:
-            self.left_img = cv2.imread("/home/grapes/Desktop/needle_pickup_example/frame000036_left.jpg")
-            # self.right_img = cv2.imread("/home/grapes/catkin_ws/src/openpi_surgical/scripts/right_img.png")
-            lw_img = cv2.imread("/home/grapes/Desktop/np_endo_psm2/frame000036_psm2.jpg")
-            rw_img = cv2.imread("/home/grapes/Desktop/np_endo_psm1/frame000036_psm1.jpg")
+        if self.get_img_from_dataset:
+            dataset_path = "/home/grapes/Desktop/needle_pickup_1"
+            start_ts = 36
+            self.left_img = cv2.imread(dataset_path + f"/left_img_dir/frame{start_ts:06d}_left.jpg")
+            lw_img = cv2.imread(dataset_path + f"/endo_psm2/frame{start_ts:06d}_psm2.jpg")
+            rw_img = cv2.imread(dataset_path + f"/endo_psm1/frame{start_ts:06d}_psm1.jpg")
+            ee_csv_path = os.path.join(dataset_path, "ee_csv.csv")
+            ee_csv = pd.read_csv(ee_csv_path)
+            # qpos_psm1 = ee_csv[self.header_name_qpos_psm1].iloc[start_ts, :].to_numpy()
+            # action_psm1 = ee_csv[self.header_name_actions_psm1].iloc[start_ts:start_ts+self.chunk_size].to_numpy() 
+            # qpos_psm2 = ee_csv[self.header_name_qpos_psm2].iloc[start_ts, :].to_numpy()
+            self.action_psm2_gt = ee_csv[self.header_name_actions_psm2].iloc[start_ts:start_ts+self.chunk_size].to_numpy() 
+            
         else:
             
             self.left_img = np.fromstring(self.rt.usb_image_left.data, np.uint8)
@@ -272,15 +315,16 @@ class LowLevelPolicy:
         
 
         lw_img = cv2.cvtColor(lw_img, cv2.COLOR_BGR2RGB)
-        # lw_img = lw_img / 255.0
+        lw_img = lw_img / 255.0
         
         rw_img = cv2.cvtColor(rw_img, cv2.COLOR_BGR2RGB)
-        # rw_img = rw_img / 255.0
+        rw_img = rw_img / 255.0
         # plt.imshow(rw_img)
         # plt.show()
 
         if self.no_states:
             state_result = np.zeros((self.state_dim))
+            # print("no states")
         else:
             state_result= np.array((self.rt.psm1_pose.position.x, self.rt.psm1_pose.position.y, self.rt.psm1_pose.position.z,
                             self.rt.psm1_pose.orientation.x, self.rt.psm1_pose.orientation.y, self.rt.psm1_pose.orientation.z, self.rt.psm1_pose.orientation.w,
@@ -290,16 +334,14 @@ class LowLevelPolicy:
                             self.rt.psm2_jaw))
         return {
             "state": state_result,
-            "images": {
-                "left": self.left_img,
-                "endo_psm1": rw_img,
-                "endo_psm2": lw_img,
-            },
-            # "prompt": "needle pickup" if self.language_instruction is None else self.language_instruction,
-            "prompt": "1_needle_pickup" if self.language_instruction is None else self.language_instruction,
+            "left_image": self.left_img,
+            "endo_psm1_image": rw_img,
+            "endo_psm2_image": lw_img,
+            # "prompt": "pick up the needle and hand it to the other arm" if self.language_instruction is None else self.language_instruction,
+            "prompt": "Needle Pickup" if self.language_instruction is None else self.language_instruction,
+            # "prompt": "1_needle_pickup" if self.language_instruction is None else self.language_instruction,
             "actions_is_pad": np.full((self.chunk_size), False),
         }
-
 
     def get_observation_dvrk_stereo(self) -> dict:
 
@@ -328,15 +370,13 @@ class LowLevelPolicy:
                             self.rt.psm2_jaw))
         return {
             "state": state_result,
-            "images": {
-                "left": self.left_img,
-                "right": self.right_img,
-            },
+            "left_image": self.left_img,
+            "right_image": self.right_img,
+            "prompt": "pick up the needle and hand it to the other arm" if self.language_instruction is None else self.language_instruction,
             # "prompt": "needle pickup" if self.language_instruction is None else self.language_instruction,
-            "prompt": "1_needle_pickup" if self.language_instruction is None else self.language_instruction,
+            # "prompt": "1_needle_pickup" if self.language_instruction is None else self.language_instruction,
             "actions_is_pad": np.full((self.chunk_size), False),
         }
-
 
     def plot_actions(self, qpos_psm1, qpos_psm2, actions_psm1, actions_psm2):
         factor = 1000
@@ -355,6 +395,38 @@ class LowLevelPolicy:
         ax.yaxis.set_major_locator(plt.MaxNLocator(n_bins))
         ax.zaxis.set_major_locator(plt.MaxNLocator(n_bins))
         plt.show()
+        
+    def plot_actions_psm2(self, qpos_psm2, actions_psm2):
+        factor = 1000
+        fig = plt.figure()
+        ax = plt.axes(projection='3d')
+        ax.scatter(actions_psm2[:, 0]*factor, actions_psm2[:, 1]*factor, actions_psm2[:, 2]*factor, c ='r', label = 'psm2 trajectory')
+        ax.scatter(qpos_psm2[0]*factor, qpos_psm2[1]*factor, qpos_psm2[2]*factor, c = 'b', marker="*" , s = 10, label = 'Current psm2 position')
+        ax.set_xlabel('X (mm)')
+        ax.set_ylabel('Y (mm)')
+        ax.set_zlabel('Z (mm)')
+        n_bins = 7
+        ax.legend()
+        ax.xaxis.set_major_locator(plt.MaxNLocator(n_bins))
+        ax.yaxis.set_major_locator(plt.MaxNLocator(n_bins))
+        ax.zaxis.set_major_locator(plt.MaxNLocator(n_bins))
+        plt.show()
+
+    def plot_actions_comparison(self, actions_psm2, actions_psm2_gt):
+        factor = 1000
+        fig = plt.figure()
+        ax = plt.axes(projection='3d')
+        ax.scatter(actions_psm2_gt[:, 0] * factor, actions_psm2_gt[:, 1]* factor, actions_psm2_gt[:, 2]* factor, c ='k', label = 'gt trajectory')
+        ax.scatter(actions_psm2[:, 0]*factor, actions_psm2[:, 1]*factor, actions_psm2[:, 2]*factor, c ='r', label = 'pred trajectory')
+        ax.set_xlabel('X (mm)')
+        ax.set_ylabel('Y (mm)')
+        ax.set_zlabel('Z (mm)')
+        n_bins = 7
+        ax.legend()
+        ax.xaxis.set_major_locator(plt.MaxNLocator(n_bins))
+        ax.yaxis.set_major_locator(plt.MaxNLocator(n_bins))
+        ax.zaxis.set_major_locator(plt.MaxNLocator(n_bins))
+        plt.show()
 
 
     def execute_actions(self, actions_psm1, actions_psm2):
@@ -364,8 +436,8 @@ class LowLevelPolicy:
 
             if not self.pause:
 
-                self.ral.spin_and_execute(self.psm1_app.run_full_pose_goal, actions_psm1[jj])
-                self.ral.spin_and_execute(self.psm2_app.run_full_pose_goal, actions_psm2[jj])
+                self.ral.spin_and_execute(self.psm1_app.run_full_pose_goal, actions_psm1[self.skip_every * jj])
+                self.ral.spin_and_execute(self.psm2_app.run_full_pose_goal, actions_psm2[self.skip_every * jj])
                 time.sleep(self.sleep_rate)
             else:
                 break
@@ -373,6 +445,8 @@ class LowLevelPolicy:
             
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    ll = LowLevelPolicy(Args)
+    args = tyro.cli(Args)
+    ll = LowLevelPolicy(args)
+    
     ll.main(tyro.cli(Args))
 

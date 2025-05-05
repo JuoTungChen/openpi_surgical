@@ -36,7 +36,8 @@ class ros_topics:
                                             Image, self.get_endo_cam_psm2)
 
     #psm1
-    self.psm1_sub = rospy.Subscriber("/PSM1/measured_cp", 
+    # self.psm1_sub = rospy.Subscriber("/PSM1/measured_cp", 
+    self.psm1_sub = rospy.Subscriber("/PSM1/setpoint_cp", 
                                             PoseStamped, self.get_psm1_pose)
 
     self.psm1_jaw_sub = rospy.Subscriber("PSM1/jaw/measured_js",
@@ -46,7 +47,7 @@ class ros_topics:
                                             PoseStamped, self.get_psm1_rcm_pose)
 
     #psm2
-    self.psm2_sub = rospy.Subscriber("/PSM2/measured_cp", 
+    self.psm2_sub = rospy.Subscriber("/PSM2/setpoint_cp", 
                                             PoseStamped, self.get_psm2_pose)
     
     self.psm2_jaw_sub = rospy.Subscriber("PSM2/jaw/measured_js",

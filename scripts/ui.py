@@ -13,7 +13,7 @@ import cv2
 # from auto_label_func import get_all_auto_labels_list
 
 RADIUS = 3
-LINEWIDTH = 6
+LINEWIDTH = 10
 
 class ImageSubscriber:
     def __init__(self):
@@ -177,6 +177,7 @@ class DrawingWindow(QMainWindow):
         self.prediction = None
         self.direction_correction = None
         self.is_correction = False
+        self.point_published = False
         self.init_ui()
         self.image_publisher = ImagePublisher()  # Initialize your publisher
         self.robot_paused = False  # Track the pause state
@@ -195,6 +196,10 @@ class DrawingWindow(QMainWindow):
         self.use_contour_pub = rospy.Publisher('/use_contour_image', Bool, queue_size=10)
         self.mid_level_action_request_pub = rospy.Publisher('/request_mid_level_action', Bool, queue_size=10)  # Publisher to request mid-level actions
         self.use_preprogrammed_correction_pub = rospy.Publisher('/use_preprogrammed_correction', Bool, queue_size=10)
+        
+        # publish sketch points
+        self.sketch_points_pub = rospy.Publisher('/sketch_points', Float32MultiArray, queue_size=10)
+        
         rospy.Subscriber('/mid_level_action', Float32MultiArray, self.mid_level_callback, queue_size=1)
         rospy.Subscriber('/instructor_prediction', String, self.instructor_prediction_callback, queue_size=1)
         rospy.Subscriber('/direction_instruction', String, self.direction_correction_callback, queue_size=1)
@@ -245,13 +250,13 @@ class DrawingWindow(QMainWindow):
         # button_layout.addWidget(radio_255)
         # button_layout.addWidget(self.custom_value_field)
 
-        # self.submit_button = QPushButton('Submit Sketch', self)
-        # self.submit_button.clicked.connect(self.submit_sketch)
-        # button_layout.addWidget(self.submit_button)
+        self.submit_button = QPushButton('Submit Sketch', self)
+        self.submit_button.clicked.connect(self.submit_sketch)
+        button_layout.addWidget(self.submit_button)
 
-        # self.reset_button = QPushButton('Reset Sketch', self)
-        # self.reset_button.clicked.connect(self.reset_sketch)
-        # button_layout.addWidget(self.reset_button)
+        self.reset_button = QPushButton('Reset Sketch', self)
+        self.reset_button.clicked.connect(self.reset_sketch)
+        button_layout.addWidget(self.reset_button)
         
         # contour_button = QPushButton("segmentation", self)
         # contour_button.setStatusTip("use contour image")
@@ -287,7 +292,14 @@ class DrawingWindow(QMainWindow):
         #     "needle pickup", "needle throw"
         #     ]
         
-        self.avail_commands = ["needle pickup", "needle throw"]
+        self.avail_commands = ["pick up the needle and hand it to the other arm", "needle pickup", "needle throw", "knot tying",
+                               "move left arm to the left", "move left arm higher", "move left arm away from me", 
+                               "move left arm to the right", "move left arm lower", "move left arm towards me", 
+                               "move right arm to the left", "move right arm higher", "move right arm away from me",
+                               "move right arm to the right", "move right arm lower", "move right arm towards me",
+                               "close both grippers", "close left gripper", "close right gripper",
+                               "open both grippers", "open left gripper", "open right gripper",
+                               "do not move"]
         # self.avail_commands = ["1_needle_pickup", "2_needle_throw",  ]
         
         self.command_label = QLabel('Select Command:')
@@ -506,6 +518,25 @@ class DrawingWindow(QMainWindow):
         self.use_preprogrammed_correction = True if state == 2 else False
         self.use_preprogrammed_correction_pub.publish(self.use_preprogrammed_correction)
         
+    # publish sketch points every 0.1 seconds if the sketch points are not empty
+    def publish_sketch_points(self):
+        if len(self.sketch_points) == 2:
+            point_coord = []
+            for point in self.sketch_points:
+                point_coord.append((point['pos'].x(), point['pos'].y()))
+            # print("point coords:", point_coord)
+            msg = Float32MultiArray()
+            msg.data = np.array(point_coord).flatten().tolist()
+            self.sketch_points_pub.publish(msg)
+            if not self.point_published:
+                self.point_published = True
+                print("Published sketch points", msg.data)
+        else:
+            self.point_published = False
+            # print("sketch points number:", len(self.sketch_points))
+            
+    
+        
     ## ----------------- callbacks -----------------
     def mid_level_callback(self, msg):
         # Update the action horizon field with the new value
@@ -694,7 +725,9 @@ class DrawingWindow(QMainWindow):
             self.drawing_pixmap = QPixmap(image_pixmap.size())
             self.drawing_pixmap.fill(Qt.transparent)
         self.merge_pimas(image_pixmap, self.drawing_pixmap)
-
+        # self.submit_sketch()
+        self.publish_sketch_points()  # Publish the sketch points
+        
     def merge_pimas(self, background, overlay):
         box_thickness = 6
         # Updated merge method to handle highlights and values
@@ -709,30 +742,31 @@ class DrawingWindow(QMainWindow):
                 color_intensity = point['value']
                 # Ensure the color intensity is within the valid range of 0-255
                 color_intensity = max(0, min(255, color_intensity))
-                pen = QPen(QColor(color_intensity, 0, 0), LINEWIDTH, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                pen = QPen(QColor(0, color_intensity, 0), LINEWIDTH, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
                 painter.setPen(pen)
                 painter.drawPoint(point['pos'])
                 painter.drawText(point['pos'] + QPoint(10, -10), str(point['value']))
                 # Set the brush to fill the circle with the same color as the pen
-                brush = QBrush(QColor(color_intensity, 0, 0))
+                brush = QBrush(QColor(0, color_intensity, 0))
                 painter.setBrush(brush)
                 
                 # Calculate position and radius
                 center = point['pos']
-
+                # print(center)
                 # Draw the circle
                 painter.drawEllipse(center, RADIUS, RADIUS)
             else:
                 color_intensity = int(point['value'])
                 
-                painter.setPen(QPen(QColor(color_intensity, 0, 0), LINEWIDTH, Qt.SolidLine))
+                painter.setPen(QPen(QColor(0, color_intensity, 0), LINEWIDTH, Qt.SolidLine))
                 painter.drawPoint(point['pos'])
                 # Set the brush to fill the circle with the same color as the pen
-                brush = QBrush(QColor(color_intensity, 0, 0))
+                brush = QBrush(QColor(0, color_intensity, 0))
                 painter.setBrush(brush)
                 
                 # Calculate position and radius
                 center = point['pos']
+                # print(center)
 
                 # Draw the circle
                 painter.drawEllipse(center, RADIUS, RADIUS)
@@ -935,7 +969,7 @@ class DrawingWindow(QMainWindow):
         if pixmap:
             qimage = pixmap.toImage()
             self.image_publisher.publish_image(qimage)
-            print(self.sketch_points)
+            # print(self.sketch_points)
             # self.sketch_points = [] # clear sketch points
         else:
             print("No image to submit.")
