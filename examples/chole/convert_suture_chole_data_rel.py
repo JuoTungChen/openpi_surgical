@@ -40,7 +40,7 @@ from PIL import Image
 import functools
 from typing import List, Literal
 import time
-
+from scipy.spatial.transform import Rotation as R
 # from multiprocessing import Pool, cpu_count
 
 # DATSET_NAME = "chole_data_lerobot_1"  # Name of the output dataset, also used for the Hugging Face Hub
@@ -95,6 +95,51 @@ def register_codecs():
 
 
 register_codecs()
+
+
+def compute_diff_actions_6d(qpos, action):
+    """
+    Computes the relative actions with respect to the current position using axis-angle rotation.
+    (Static method version)
+
+    Parameters:
+    - qpos: Current pose (array of shape [8] - xyz, xyzw, jaw angle)
+    - action: Actions commanded by the user (array of shape [n_actions x 8] - xyz, xyzw, jaw angle)
+
+    Returns:
+    - diff_expand: Relative actions with delta translation and delta rotation in axis-angle format.
+                Shape: (n_actions, 10) - [delta_translation (3), delta_rotation (6D), jaw_angle (1)]
+    """
+    # Compute the delta translation w.r.t da vinci endoscope tip frame (approx the camera frame)
+    delta_translation = action[:, 0:3] - qpos[0:3]  # Shape: (n_actions, 3)
+
+    # Extract quaternions from qpos and action
+    quat_init = qpos[3:7]  # Shape: (4,)
+    quat_actions = action[:, 3:7]  # Shape: (n_actions, 4)
+
+    # Convert quaternions to Rotation objects
+    r_init = R.from_quat(quat_init)
+    r_actions = R.from_quat(quat_actions)
+
+    # Compute the relative rotations
+    diff_rs = r_init.inv() * r_actions  # Shape: (n_actions,)
+
+    # Convert 3x3 rotation matrices to 6D representation (first two columns)
+    diff_matrices = diff_rs.as_matrix()  # Shape: (n_actions, 3, 3)
+    diff_6d = diff_matrices[:, :, :2].transpose(0, 2, 1).reshape(-1, 6)  # Shape: (n_actions, 6)
+
+    # Extract the jaw angle from the action (note: jaw angle is not relative)
+    jaw_angle = action[:, -1]  # Shape: (n_actions,)
+
+    # Prepare the final diff array
+    delta_action = np.zeros((action.shape[0], 10))  # Shape: (n_actions, 10)
+
+    # Populate the diff_expand array
+    delta_action[:, 0:3] = delta_translation  # Delta translation
+    delta_action[:, 3:9] = diff_6d  # Delta rotation (6D)
+    delta_action[:, -1] = jaw_angle  # Jaw angle (not relative)
+
+    return delta_action
 
 
 def read_images(image_dir: str, file_pattern: str) -> np.ndarray:
@@ -176,40 +221,37 @@ def process_all_chole_episodes(base_dir: str, tissue_indices: List[int], repo_id
     #    shutil.rmtree(LEROBOT_HOME / repo_id)
 
     states_name = [
-        "psm1_pose.position.x",
-        "psm1_pose.position.y",
-        "psm1_pose.position.z",
-        "psm1_pose.orientation.x",
-        "psm1_pose.orientation.y",
-        "psm1_pose.orientation.z",
-        "psm1_pose.orientation.w",
-        "psm1_jaw",
-        "psm2_pose.position.x",
-        "psm2_pose.position.y",
-        "psm2_pose.position.z",
-        "psm2_pose.orientation.x",
-        "psm2_pose.orientation.y",
-        "psm2_pose.orientation.z",
-        "psm2_pose.orientation.w",
-        "psm2_jaw",
+        "psm1.position.x",
+        "psm1.position.y",
+        "psm1.position.z",
+        "psm1.orientation.x",
+        "psm1.orientation.y",
+        "psm1.orientation.z",
+        "psm1.orientation.w",
+        "psm1.jaw",
+        "psm2.position.x",
+        "psm2.position.y",
+        "psm2.position.z",
+        "psm2.orientation.euler_x",
+        "psm2.orientation.euler_y",
+        "psm2.orientation.euler_z",
+        "psm2.jaw",
     ]
     actions_name = [
-        "psm1_sp.position.x",
-        "psm1_sp.position.y",
-        "psm1_sp.position.z",
-        "psm1_sp.orientation.x",
-        "psm1_sp.orientation.y",
-        "psm1_sp.orientation.z",
-        "psm1_sp.orientation.w",
-        "psm1_jaw_sp",
-        "psm2_sp.position.x",
-        "psm2_sp.position.y",
-        "psm2_sp.position.z",
-        "psm2_sp.orientation.x",
-        "psm2_sp.orientation.y",
-        "psm2_sp.orientation.z",
-        "psm2_sp.orientation.w",
-        "psm2_jaw_sp",
+        "psm1.position.x",
+        "psm1.position.y",
+        "psm1.position.z",
+        "psm1.orientation.euler_x",
+        "psm1.orientation.euler_y",
+        "psm1.orientation.euler_z",
+        "psm1.jaw",
+        "psm2.position.x",
+        "psm2.position.y",
+        "psm2.position.z",
+        "psm2.orientation.euler_x",
+        "psm2.orientation.euler_y",
+        "psm2.orientation.euler_z",
+        "psm2.jaw",
     ]
 
     dataset_path = LEROBOT_HOME / repo_id

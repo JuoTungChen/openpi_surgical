@@ -22,7 +22,6 @@ import shutil
 
 from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-
 # import tensorflow_datasets as tfds
 import tyro
 
@@ -66,12 +65,10 @@ def _assert_shape(arr: np.ndarray, expected_shape: tuple[int | None, ...]):
         if expected_dim is not None:
             assert dim == expected_dim, (arr.shape, expected_shape)
 
-
 class JpegCodec(numcodecs.abc.Codec):
     """Codec for JPEG compression.
     Encodes image chunks as JPEGs. Assumes that chunks are uint8 with shape (1, H, W, 3).
     """
-
     codec_id = "pi_jpeg"
 
     def __init__(self, quality: int = 95):
@@ -87,15 +84,12 @@ class JpegCodec(numcodecs.abc.Codec):
         img = simplejpeg.decode_jpeg(buf, buffer=out)
         return img[np.newaxis, ...]
 
-
 @functools.cache
 def register_codecs():
     """Register the custom codecs."""
     numcodecs.register_codec(JpegCodec)
 
-
 register_codecs()
-
 
 def read_images(image_dir: str, file_pattern: str) -> np.ndarray:
     """Reads images from a directory into a NumPy array."""
@@ -115,31 +109,31 @@ def read_images(image_dir: str, file_pattern: str) -> np.ndarray:
     else:
         return np.empty((0, 0, 0, 3), dtype=np.uint8)
 
-
 def process_episode(dataset, episode_path, states_name, actions_name):
     """Processes a single episode, save the data to lerobot format"""
 
     # Paths to image directories
-    left_dir = os.path.join(episode_path, "left_img_dir")
-    right_dir = os.path.join(episode_path, "right_img_dir")
-    psm1_dir = os.path.join(episode_path, "endo_psm1")
-    psm2_dir = os.path.join(episode_path, "endo_psm2")
-    csv_file = os.path.join(episode_path, "ee_csv.csv")
+    left_dir = os.path.join(episode_path, 'left_img_dir')
+    right_dir = os.path.join(episode_path, 'right_img_dir')
+    psm1_dir = os.path.join(episode_path, 'endo_psm1')
+    psm2_dir = os.path.join(episode_path, 'endo_psm2')
+    csv_file = os.path.join(episode_path, 'ee_csv.csv')
 
     # Read CSV to determine the number of frames (excluding header)
     df = pd.read_csv(csv_file)
 
     # Read images from each camera
-    left_images = read_images(left_dir, "frame{:06d}_left.jpg")
-    right_images = read_images(right_dir, "frame{:06d}_right.jpg")
-    psm1_images = read_images(psm1_dir, "frame{:06d}_psm1.jpg")
-    psm2_images = read_images(psm2_dir, "frame{:06d}_psm2.jpg")
+    left_images = read_images(left_dir, 'frame{:06d}_left.jpg')
+    right_images = read_images(right_dir, 'frame{:06d}_right.jpg')
+    psm1_images = read_images(psm1_dir, 'frame{:06d}_psm1.jpg')
+    psm2_images = read_images(psm2_dir, 'frame{:06d}_psm2.jpg')
     # print(left_images.shape, right_images.shape, psm1_images.shape, psm2_images.shape)
     num_frames = min(len(df), left_images.shape[0])
 
     # Read kinematics data and convert to structured array with headers
     kinematics_data = np.array(
-        [tuple(row) for row in df.to_numpy()], dtype=[(col, df[col].dtype.str) for col in df.columns]
+        [tuple(row) for row in df.to_numpy()],
+        dtype=[(col, df[col].dtype.str) for col in df.columns]
     )
     print(episode_path)
     # print(kinematics_data.dtype.names)
@@ -148,18 +142,17 @@ def process_episode(dataset, episode_path, states_name, actions_name):
 
     for i in range(num_frames):
         frame = {
-            "observation.state": np.hstack([kinematics_data[n][i] for n in states_name]),
-            "action": np.hstack([kinematics_data[n][i] for n in actions_name]),
+            "observation.state": np.hstack([
+                kinematics_data[n][i] for n in states_name
+            ]),
+            "action": np.hstack([
+                kinematics_data[n][i] for n in actions_name
+            ]),
         }
         # print("state", frame["observation.state"])
         # print("action", frame["action"])
 
-        for cam_name, images in [
-            ("left", left_images),
-            ("right", right_images),
-            ("endo_psm1", psm1_images),
-            ("endo_psm2", psm2_images),
-        ]:
+        for cam_name, images in [('left', left_images), ('right', right_images), ('endo_psm1', psm1_images), ('endo_psm2', psm2_images)]:
             if images.size > 0:
                 frame[f"observation.images.{cam_name}"] = images[i]
 
@@ -171,9 +164,11 @@ def process_episode(dataset, episode_path, states_name, actions_name):
 def process_all_chole_episodes(base_dir: str, tissue_indices: List[int], repo_id: str):
     """Processes all episodes for given tissue indices using multiprocessing."""
 
+
     # if (LEROBOT_HOME / repo_id).exists():
     #    print("removing existing dataset")
     #    shutil.rmtree(LEROBOT_HOME / repo_id)
+
 
     states_name = [
         "psm1_pose.position.x",
@@ -192,6 +187,7 @@ def process_all_chole_episodes(base_dir: str, tissue_indices: List[int], repo_id
         "psm2_pose.orientation.z",
         "psm2_pose.orientation.w",
         "psm2_jaw",
+
     ]
     actions_name = [
         "psm1_sp.position.x",
@@ -212,6 +208,7 @@ def process_all_chole_episodes(base_dir: str, tissue_indices: List[int], repo_id
         "psm2_jaw_sp",
     ]
 
+    
     dataset_path = LEROBOT_HOME / repo_id
 
     if not dataset_path.exists():
@@ -239,12 +236,13 @@ def process_all_chole_episodes(base_dir: str, tissue_indices: List[int], repo_id
         num_episodes = dataset.num_episodes
         print(f"Resuming conversion. Existing dataset found at {dataset_path} with {num_episodes} episodes")
 
+
     # measure time taken to complete the process
     start_time = time.time()
     count = 0
 
     for idx in tissue_indices:
-        tissue_dir = os.path.join(base_dir, f"tissue_{idx}")
+        tissue_dir = os.path.join(base_dir, f'tissue_{idx}')
         if not os.path.exists(tissue_dir):
             print(f"Warning: {tissue_dir} does not exist.")
             exit()
@@ -259,7 +257,7 @@ def process_all_chole_episodes(base_dir: str, tissue_indices: List[int], repo_id
 
             if subtask_prompt.endswith("recovery"):
                 subtask_prompt = subtask_prompt[:-9]
-
+            
             for episode_name in os.listdir(subtask_dir):
                 episode_dir = os.path.join(subtask_dir, episode_name)
                 if not os.path.isdir(episode_dir):
@@ -282,9 +280,11 @@ def process_all_chole_episodes(base_dir: str, tissue_indices: List[int], repo_id
 def process_all_suturing_episodes(base_dir: str, num_chole_episodes: int, repo_id: str):
     """Processes all episodes for given tissue indices using multiprocessing."""
 
+
     # if (LEROBOT_HOME / repo_id).exists():
     #    print("removing existing dataset")
     #    shutil.rmtree(LEROBOT_HOME / repo_id)
+
 
     states_name = [
         "psm1_pose.position.x",
@@ -303,6 +303,7 @@ def process_all_suturing_episodes(base_dir: str, num_chole_episodes: int, repo_i
         "psm2_pose.orientation.z",
         "psm2_pose.orientation.w",
         "psm2_jaw",
+
     ]
     actions_name = [
         "psm1_sp.position.x",
@@ -323,6 +324,7 @@ def process_all_suturing_episodes(base_dir: str, num_chole_episodes: int, repo_i
         "psm2_jaw_sp",
     ]
 
+    
     dataset_path = LEROBOT_HOME / repo_id
 
     if not dataset_path.exists():
@@ -350,11 +352,12 @@ def process_all_suturing_episodes(base_dir: str, num_chole_episodes: int, repo_i
         num_episodes = dataset.num_episodes
         print(f"Resuming conversion. Existing dataset found at {dataset_path} with {num_episodes} episodes")
 
+
     # measure time taken to complete the process
     start_time = time.time()
     count = num_chole_episodes
-    idx = 10
-    tissue_dir = os.path.join(base_dir, f"tissue_{idx}")
+    idx = 1
+    tissue_dir = os.path.join(base_dir, f'tissue_{idx}')
     if not os.path.exists(tissue_dir):
         print(f"Warning: {tissue_dir} does not exist.")
         exit()
@@ -368,7 +371,7 @@ def process_all_suturing_episodes(base_dir: str, num_chole_episodes: int, repo_i
 
         if subtask_prompt.endswith("recovery"):
             subtask_prompt = subtask_prompt[:-9]
-
+        
         for episode_name in os.listdir(subtask_dir):
             episode_dir = os.path.join(subtask_dir, episode_name)
             if not os.path.isdir(episode_dir):
@@ -383,7 +386,6 @@ def process_all_suturing_episodes(base_dir: str, num_chole_episodes: int, repo_i
 
         print(f"subtask {subtask_name} processed successful, time taken: {time.time() - start_time}")
     print(f"suturing processed successful, time taken: {time.time() - start_time}")
-    return dataset
 
 
 def create_dataset(
@@ -397,6 +399,7 @@ def create_dataset(
     # has_effort: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
+    
     cameras = [
         "left",
         "right",
@@ -446,8 +449,8 @@ def create_dataset(
     dataset.start_image_writer(dataset_config.image_writer_processes, dataset_config.image_writer_threads)
     return dataset
 
-
 def create_empty_dataset(
+        
     repo_id: str,
     robot_type: str,
     states_name: List[str],
@@ -458,6 +461,7 @@ def create_empty_dataset(
     # has_effort: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
+    
     cameras = [
         "left",
         "right",
@@ -509,18 +513,17 @@ def create_empty_dataset(
     )
 
 
+
 if __name__ == "__main__":
     # tyro.cli(main)
     # base_dir = '.'  # Current directory
     # output_base_dir = './processed_data'  # New folder for Zarr files
     chole_base_dir = "/home/iulian/chole_ws/data/base_chole_clipping_cutting"  # Name of the output dataset, also used for the Hugging Face Hub
-    suturing_base_dir = (
-        "/home/iulian/chole_ws/data/Jesse"  # Name of the output dataset, also used for the Hugging Face Hub
-    )
+    suturing_base_dir = "/home/iulian/chole_ws/data/test"  # Name of the output dataset, also used for the Hugging Face Hub
     repo_id = "suturing_lerobot"  # Name of the output dataset, also used for the Hugging Face Hub
-    # tissue_indices = [1, 2, 4, 5, 6, 8, 12, 13, 14, 18, 19, 22, 23, 30, 32, 35, 39, 40, 41, 47, 49, 50, 53, 54, 71, 72, 73, 75, 77, 80]  # Replace with your list of indices
+    tissue_indices = [1, 2, 4, 5, 6, 8, 12, 13, 14, 18, 19, 22, 23, 30, 32, 35, 39, 40, 41, 47, 49, 50, 53, 54, 71, 72, 73, 75, 77, 80]  # Replace with your list of indices
 
-    # dataset, chole_num_episodes = process_all_chole_episodes(chole_base_dir, tissue_indices, repo_id)
-    # print(f"Processed {chole_num_episodes} chole episodes")
-    dataset = process_all_suturing_episodes(suturing_base_dir, 0, repo_id)
+    dataset, chole_num_episodes = process_all_chole_episodes(chole_base_dir, tissue_indices, repo_id)
+    print(f"Processed {chole_num_episodes} chole episodes")
+    dataset = process_all_suturing_episodes(suturing_base_dir, chole_num_episodes, repo_id)
     dataset.consolidate()
