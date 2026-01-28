@@ -136,6 +136,31 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    # Optional: use gr00t local LeRobot dataset loader instead of HF LeRobotDataset.
+    if data_config.gr00t_dataset_path is not None:
+        from openpi.training.gr00t_lerobot_dataset import Gr00tDatasetSpec, Gr00tLeRobotTorchDataset
+
+        if data_config.gr00t_embodiment_tag is None:
+            raise ValueError("gr00t_embodiment_tag must be set when gr00t_dataset_path is set.")
+
+        # Note: action_horizon is implied by gr00t modality config delta_indices. We do a soft check here
+        # to catch accidental mismatches between model config and embodiment config.
+        # The dataset will still return whatever horizon the embodiment config defines.
+        spec = Gr00tDatasetSpec(
+            dataset_path=data_config.gr00t_dataset_path,
+            embodiment_tag=data_config.gr00t_embodiment_tag,
+            modality_config_path=data_config.gr00t_modality_config_path,
+            action_horizon=int(action_horizon),
+            language_key=data_config.gr00t_language_key,
+            video_views=list(data_config.gr00t_video_views) if data_config.gr00t_video_views is not None else None,
+            episode_cache_size=int(data_config.gr00t_episode_cache_size),
+            video_backend=data_config.gr00t_video_backend,
+            apply_action_transforms=data_config.gr00t_apply_action_transforms,
+            stats_key=data_config.gr00t_stats_key,
+        )
+        dataset = Gr00tLeRobotTorchDataset(spec)
+        return dataset
+
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
@@ -229,6 +254,11 @@ def create_data_loader(
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training."""
     data_config = config.data.create(config.assets_dirs, config.model)
+
+    # When GR00T action transforms are enabled, skip OpenPI's normalization
+    # since StateActionProcessor handles all normalization
+    if hasattr(data_config, 'gr00t_apply_action_transforms') and data_config.gr00t_apply_action_transforms:
+        skip_norm_stats = True
 
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(

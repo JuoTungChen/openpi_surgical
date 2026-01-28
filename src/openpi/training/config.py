@@ -96,6 +96,29 @@ class DataConfig:
     # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
 
+    # Optional: local LeRobot dataset loaded via `gr00t` (instead of HF LeRobotDataset).
+    # If set, `openpi.training.data_loader.create_torch_dataset` will use the gr00t-backed dataset adapter.
+    gr00t_dataset_path: str | None = None
+    # Embodiment tag string used to look up modality configs in `gr00t.configs.data.embodiment_configs.MODALITY_CONFIGS`.
+    gr00t_embodiment_tag: str | None = None
+    # Optional language key to map into "prompt" (if present in dataset). This is interpreted by gr00t configs.
+    gr00t_language_key: str | None = None
+    # Optional explicit list of video view keys to expose as observation images (defaults to gr00t modality order).
+    gr00t_video_views: Sequence[str] | None = None
+    # Per-worker cache size for decoded episodes (small integer). Higher can speed up sampling at the cost of RAM.
+    gr00t_episode_cache_size: int = 1
+    # Video backend for gr00t video decoding.
+    gr00t_video_backend: str = "torchcodec"
+    # Optional path to GR00T modality config file (e.g., dVRK_config.py).
+    # If provided, will be imported to register the embodiment before dataset creation.
+    gr00t_modality_config_path: str | None = None
+    # If True, apply GR00T's action representation transformations (hybrid-relative, rot6d, etc.).
+    # When True: actions are processed according to GR00T ActionConfig (may change action dimension).
+    # When False: actions remain in raw format from dataset.
+    gr00t_apply_action_transforms: bool = True
+    # Statistics key for normalization (if None, will be inferred from embodiment_tag).
+    gr00t_stats_key: str | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -454,6 +477,70 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class Gr00tLocalLeRobotDataConfig(DataConfigFactory):
+    """
+    DataConfig for training on a *local* LeRobot-format dataset using gr00t's loader + embodiment configs.
+
+    This enables reusing gr00t's modality configs (video/state/action/language, action horizon) and video decoding
+    without copying any of the gr00t data code.
+
+    Notes:
+    - `repo_id` is still required (used for asset_id + checkpoint metadata). It does NOT need to be a HF repo id.
+    - You must provide `dataset_path` (local path) and `embodiment_tag` (string from gr00t MODALITY_CONFIGS).
+    - You will typically set a `repack_transforms` mapping that maps your dataset's views into the image keys
+      expected by openpi models (see `openpi.models.model.IMAGE_KEYS`).
+    """
+
+    dataset_path: str = tyro.MISSING
+    embodiment_tag: str = tyro.MISSING
+    modality_config_path: str | None = None  # Path to GR00T modality config file
+    language_key: str | None = None
+    video_views: Sequence[str] | None = None
+    episode_cache_size: int = 1
+    video_backend: str = "torchcodec"
+    apply_action_transforms: bool = True  # Apply GR00T action representation transforms
+    stats_key: str | None = None  # Statistics key for normalization
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base = self.create_base_config(assets_dirs, model_config)
+
+        # When GR00T action transforms are enabled, StateActionProcessor handles normalization
+        # So we should disable OpenPI's normalization for actions (but keep it for images/state if needed)
+        if self.apply_action_transforms:
+            # Clear norm_stats to disable OpenPI's normalization
+            # GR00T's StateActionProcessor will handle all normalization
+            base = dataclasses.replace(base, norm_stats=None, use_quantile_norm=False)
+
+        # Ensure images have masks (some local datasets don't provide them).
+        data_transforms = base.data_transforms
+        if len(data_transforms.inputs) == 0 and len(data_transforms.outputs) == 0:
+            data_transforms = _transforms.Group(inputs=[_transforms.EnsureImageMask()])
+
+        # Ensure model transforms exist by default (prompt injection, resize, tokenization, padding).
+        # If the caller provided model_transforms in base_config, keep them.
+        model_transforms = base.model_transforms
+        if len(model_transforms.inputs) == 0 and len(model_transforms.outputs) == 0:
+            model_transforms = ModelTransformFactory()(model_config)
+
+        # Set gr00t-specific fields on the DataConfig
+        return dataclasses.replace(
+            base,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            gr00t_dataset_path=self.dataset_path,
+            gr00t_embodiment_tag=self.embodiment_tag,
+            gr00t_modality_config_path=self.modality_config_path,
+            gr00t_language_key=self.language_key,
+            gr00t_video_views=list(self.video_views) if self.video_views else None,
+            gr00t_episode_cache_size=self.episode_cache_size,
+            gr00t_video_backend=self.video_backend,
+            gr00t_apply_action_transforms=self.apply_action_transforms,
+            gr00t_stats_key=self.stats_key,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -745,6 +832,55 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets-preview/checkpoints/pi05_may21_280k_v1/params"
         ),
+        num_train_steps=30_000,
+    ),
+    #
+    # Example: pi0.5 training from a local LeRobot dataset via gr00t loader + embodiment configs.
+    #
+    TrainConfig(
+        name="pi05_gr00t_local",
+        model=pi0.Pi0Config(pi05=True),
+        data=Gr00tLocalLeRobotDataConfig(
+            # Used for checkpoint metadata + default asset_id. Doesn't need to exist on HF.
+            repo_id="local/gr00t_lerobot",
+            # Local LeRobot dataset root (contains meta/ and data/).
+            dataset_path="/home/iulian/chole_ws/data/open_h_suturing",
+            # Must match a key in `gr00t.configs.data.embodiment_configs.MODALITY_CONFIGS`
+            embodiment_tag="dvrk",
+            # Path to GR00T modality config file (required for embodiment registration)
+            modality_config_path="/home/iulian/chole_ws/src/gr00t_n1.6/examples/dVRK/dVRK_config.py",
+            # Optional: choose what text to map into "prompt" (depends on dataset + gr00t config).
+            language_key=None,
+            # Optional: restrict to a specific set/order of video views.
+            video_views=[
+                "endoscope_left",
+                "wrist_left",
+                "wrist_right",
+            ],
+            # Example repack: map your dataset's views to the openpi default image keys.
+            # Update view names to match your dataset's "video" modality keys.
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "image": {
+                                    # Use left endoscope as the base view (required by pi0/pi0.5).
+                                    "base_0_rgb": "observation.images.endoscope_left",
+                                    "left_wrist_0_rgb": "observation.images.wrist_left",
+                                    "right_wrist_0_rgb": "observation.images.wrist_right",
+                                },
+                                "state": "observation.state",
+                                "actions": "actions",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+            ),
+        ),
+        # You likely want to load a pi0.5 base checkpoint. Replace path as needed.
+        # weight_loader=weight_loaders.CheckpointWeightLoader("<path_or_gs_uri_to_pi05_base_params>"),
         num_train_steps=30_000,
     ),
     #
