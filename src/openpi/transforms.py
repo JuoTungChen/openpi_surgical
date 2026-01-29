@@ -192,6 +192,31 @@ class ResizeImages(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class EnsureImageMask(DataTransformFn):
+    """Ensure `image_mask` exists for all images.
+
+    Some dataset backends provide images but no validity masks. `openpi.models.model.Observation.from_dict`
+    expects `image_mask` to be present, so we default to "all valid".
+    """
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "image" not in data:
+            return data
+        if "image_mask" in data:
+            return data
+
+        # Derive batch shape from state if present; otherwise use scalar True (unbatched).
+        if (state := data.get("state")) is not None and hasattr(state, "shape"):
+            batch_shape = state.shape[:-1]
+            default_mask = np.ones(batch_shape, dtype=np.bool_)
+        else:
+            default_mask = np.asarray(True)
+
+        data["image_mask"] = {k: default_mask for k in data["image"].keys()}
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class SubsampleActions(DataTransformFn):
     stride: int
 
