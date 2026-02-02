@@ -2,6 +2,11 @@
 
 This guide explains how to train OpenPI models (Pi0/Pi0.5) using GR00T's data loaders and action representation transforms.
 
+## Quick Links
+
+- **[Performance Tuning Guide](performance_tuning.md)**: Optimize GPU utilization and data loading
+- **[Main README](README.md)**: Quick start and overview
+
 ## Overview
 
 The GR00T integration enables OpenPI to:

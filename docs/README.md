@@ -3,6 +3,7 @@
 ## Training Guides
 
 - **[GR00T Training Guide](groot_training_guide.md)**: Complete guide for training OpenPI models using GR00T data loaders and action representation transforms
+- **[Performance Tuning Guide](performance_tuning.md)**: Optimize GPU utilization and data loading performance
 
 ## Quick Start with GR00T
 

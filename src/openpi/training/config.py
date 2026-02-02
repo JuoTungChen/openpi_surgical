@@ -496,7 +496,9 @@ class Gr00tLocalLeRobotDataConfig(DataConfigFactory):
     modality_config_path: str | None = None  # Path to GR00T modality config file
     language_key: str | None = None
     video_views: Sequence[str] | None = None
-    episode_cache_size: int = 1
+    # Episode cache size per worker. Increase for better performance (reduces video re-decoding).
+    # Good rule of thumb: set to (total_episodes / num_workers) for optimal caching.
+    episode_cache_size: int = 16
     video_backend: str = "torchcodec"
     apply_action_transforms: bool = True  # Apply GR00T action representation transforms
     stats_key: str | None = None  # Statistics key for normalization
@@ -882,6 +884,8 @@ _CONFIGS = [
         # You likely want to load a pi0.5 base checkpoint. Replace path as needed.
         # weight_loader=weight_loaders.CheckpointWeightLoader("<path_or_gs_uri_to_pi05_base_params>"),
         num_train_steps=30_000,
+        # Increased workers and episode cache for better GPU utilization
+        num_workers=8,  # More workers for parallel data loading (adjust based on CPU cores)
     ),
     #
     # Fine-tuning Aloha configs.

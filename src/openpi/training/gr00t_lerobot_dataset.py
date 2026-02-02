@@ -62,7 +62,9 @@ class Gr00tDatasetSpec:
     # Which video view keys to expose as observation images. If None, uses gr00t modality config order.
     video_views: list[str] | None = None
     # Cache size for decoded episodes per worker process.
-    episode_cache_size: int = 1
+    # Larger values reduce video decoding overhead but use more memory.
+    # Recommended: Set to number of episodes / num_workers for best performance.
+    episode_cache_size: int = 16
     # Video backend args forwarded into gr00t loader.
     video_backend: str = "torchcodec"
     video_backend_kwargs: dict[str, Any] | None = None

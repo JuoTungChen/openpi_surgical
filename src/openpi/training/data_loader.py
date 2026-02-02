@@ -412,8 +412,12 @@ class TorchDataLoader:
         self._num_batches = num_batches
 
         mp_context = None
+        prefetch_factor = 2  # Default PyTorch value
         if num_workers > 0:
             mp_context = multiprocessing.get_context("spawn")
+            # Increase prefetch factor for better GPU utilization
+            # Each worker will prefetch this many batches ahead
+            prefetch_factor = 4
 
         generator = torch.Generator()
         generator.manual_seed(seed)
@@ -424,6 +428,7 @@ class TorchDataLoader:
             num_workers=num_workers,
             multiprocessing_context=mp_context,
             persistent_workers=num_workers > 0,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
             drop_last=True,
