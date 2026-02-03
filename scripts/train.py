@@ -423,6 +423,8 @@ def main(config: _config.TrainConfig):
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     # Create optimized training step with compilation cache warming (with fallback)
+    # Track whether we're using optimized version (which has different signature)
+    using_optimized_step = False
     if jax_optimizer:
         try:
             # Create a safe copy of train_state before passing to optimizer
@@ -439,6 +441,7 @@ def main(config: _config.TrainConfig):
                 data_sharding=data_sharding,
                 replicated_sharding=replicated_sharding,
             )
+            using_optimized_step = True
             logging.info("Using optimized training step")
         except Exception as e:
             logging.warning(f"Failed to create optimized training step: {e}")
@@ -522,7 +525,13 @@ def main(config: _config.TrainConfig):
                 performance_integrator.on_computation_start()
             
             with sharding.set_mesh(mesh):
-                train_state, info = ptrain_step(config, train_rng, train_state, batch)
+                # Use appropriate signature based on whether we're using optimized step
+                # Optimized step has config baked in: (rng, train_state, batch)
+                # Standard step requires config: (config, rng, train_state, batch)
+                if using_optimized_step:
+                    train_state, info = ptrain_step(train_rng, train_state, batch)
+                else:
+                    train_state, info = ptrain_step(config, train_rng, train_state, batch)
             
             # Mark computation end
             if performance_integrator:
