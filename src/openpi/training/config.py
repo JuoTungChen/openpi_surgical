@@ -609,7 +609,7 @@ class TrainConfig:
     fsdp_devices: int = 1
 
     # GPU utilization monitoring settings
-    enable_gpu_monitoring: bool = True
+    enable_gpu_monitoring: bool = False
     target_gpu_utilization: float = 0.85
     gpu_monitoring_interval: float = 1.0
     enable_bottleneck_detection: bool = True
