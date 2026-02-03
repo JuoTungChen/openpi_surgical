@@ -290,14 +290,32 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                 import json
                 from pathlib import Path
                 from gr00t.data.state_action.state_action_processor import StateActionProcessor
-                
-                # Try to load statistics for action representation transformations
+
+                # GR00T-style behavior: stats are per-dataset and keyed by repo_id at runtime.
+                # We always derive stats_key from the dataset path name for training.
+                self._stats_key = Path(spec.dataset_path).name
+                if spec.stats_key is not None and spec.stats_key != self._stats_key:
+                    warnings.warn(
+                        f"Ignoring provided stats_key '{spec.stats_key}' and using repo_id '{self._stats_key}' "
+                        "to match GR00T per-dataset stats behavior.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+
                 stats_path = Path(spec.dataset_path) / "meta" / "percentile_stats.json"
                 if stats_path.exists():
-                    with open(stats_path, 'r') as f:
-                        self._statistics = json.load(f)
-                    # Use provided stats_key or infer from embodiment_tag
-                    self._stats_key = spec.stats_key or spec.embodiment_tag
+                    with open(stats_path, "r") as f:
+                        stats_data = json.load(f)
+
+                    # If stats are unkeyed (GR00T default), wrap them under stats_key and attach embodiment metadata.
+                    # This mirrors gr00t.data.dataset.ShardedMixtureDataset.setup_per_dataset_statistics.
+                    if "state" in stats_data and "action" in stats_data:
+                        stats_data["__embodiment_tag__"] = spec.embodiment_tag
+                        self._statistics = {self._stats_key: stats_data}
+                    else:
+                        # Already keyed (e.g., consolidated stats file).
+                        self._statistics = stats_data
+
                     if self._stats_key not in self._statistics:
                         warnings.warn(
                             f"Statistics key '{self._stats_key}' not found in {stats_path}. "
@@ -309,7 +327,7 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                         self._stats_key = None
                         self._statistics = None
                     else:
-                        # Initialize StateActionProcessor with loaded statistics
+                        # Initialize StateActionProcessor with loaded statistics.
                         self._processor = StateActionProcessor(
                             modality_configs={spec.embodiment_tag: self._modality_configs},
                             statistics=self._statistics,
@@ -502,6 +520,18 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
 
     def __len__(self) -> int:
         return self._total_steps
+
+    def get_consolidated_statistics(self) -> dict[str, dict[str, Any]] | None:
+        """Return GR00T-style keyed statistics for this dataset.
+
+        The returned dict is keyed by `stats_key` (repo_id), matching GR00T's
+        `use_per_dataset_stats` flow. Each entry includes `__embodiment_tag__`
+        so downstream components can look up the correct modality config.
+
+        Returns:
+            The keyed statistics dict if available, otherwise None.
+        """
+        return self._statistics
 
     def _global_to_episode_step(self, index: int) -> tuple[int, int]:
         if index < 0:

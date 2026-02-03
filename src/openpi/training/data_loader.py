@@ -4,7 +4,7 @@ import os
 import psutil
 import time
 import typing
-from typing import Protocol, SupportsIndex, TypeVar
+from typing import Any, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -320,7 +320,7 @@ def create_data_loader(
 
     # When GR00T action transforms are enabled, skip OpenPI's normalization
     # since StateActionProcessor handles all normalization
-    if hasattr(data_config, 'gr00t_apply_action_transforms') and data_config.gr00t_apply_action_transforms:
+    if hasattr(data_config, "gr00t_apply_action_transforms") and data_config.gr00t_apply_action_transforms:
         skip_norm_stats = True
 
     if data_config.rlds_data_dir is not None:
@@ -673,3 +673,15 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+    def get_gr00t_statistics(self) -> dict[str, dict[str, Any]] | None:
+        """Return GR00T-style keyed statistics if the underlying dataset provides them.
+
+        This is used to persist consolidated per-dataset stats alongside checkpoints
+        so GR00T-style inference can select the correct `stats_key` later.
+        """
+        if isinstance(self._data_loader, TorchDataLoader):
+            dataset = self._data_loader.torch_loader.dataset
+            if hasattr(dataset, "get_consolidated_statistics"):
+                return dataset.get_consolidated_statistics()
+        return None
