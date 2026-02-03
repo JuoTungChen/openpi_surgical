@@ -120,9 +120,17 @@ class GPUUtilizationMonitor:
         while self._monitoring:
             try:
                 metrics = self._collect_gpu_metrics()
-                with self._lock:
-                    self.current_metrics = metrics
-                    self.metrics_history.append(metrics)
+                # Use timeout to avoid blocking the main thread
+                if self._lock.acquire(timeout=0.5):
+                    try:
+                        self.current_metrics = metrics
+                        self.metrics_history.append(metrics)
+                    finally:
+                        self._lock.release()
+                else:
+                    # Skip this update if we can't get the lock quickly
+                    logging.debug("GPU monitoring lock timeout, skipping update")
+                
                 time.sleep(self.monitoring_interval)
             except Exception as e:
                 logging.error(f"Error in GPU monitoring loop: {e}")
@@ -189,15 +197,27 @@ class GPUUtilizationMonitor:
     
     def get_memory_usage_stats(self) -> Dict[str, float]:
         """Get GPU memory usage statistics."""
-        with self._lock:
-            if self.current_metrics is None:
+        try:
+            # Use timeout to avoid deadlock
+            if self._lock.acquire(timeout=1.0):
+                try:
+                    if self.current_metrics is None:
+                        return {"usage_bytes": 0, "total_bytes": 0, "usage_fraction": 0.0}
+                    
+                    return {
+                        "usage_bytes": self.current_metrics.gpu_memory_usage,
+                        "total_bytes": self.current_metrics.gpu_memory_total,
+                        "usage_fraction": self.current_metrics.gpu_memory_usage / max(self.current_metrics.gpu_memory_total, 1),
+                    }
+                finally:
+                    self._lock.release()
+            else:
+                # Timeout occurred, return default values
+                logging.warning("GPU memory stats lock timeout, returning defaults")
                 return {"usage_bytes": 0, "total_bytes": 0, "usage_fraction": 0.0}
-            
-            return {
-                "usage_bytes": self.current_metrics.gpu_memory_usage,
-                "total_bytes": self.current_metrics.gpu_memory_total,
-                "usage_fraction": self.current_metrics.gpu_memory_usage / max(self.current_metrics.gpu_memory_total, 1),
-            }
+        except Exception as e:
+            logging.error(f"Error getting GPU memory stats: {e}")
+            return {"usage_bytes": 0, "total_bytes": 0, "usage_fraction": 0.0}
     
     def detect_bottlenecks(self) -> List[BottleneckType]:
         """Detect performance bottlenecks based on recent metrics."""

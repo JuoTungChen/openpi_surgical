@@ -425,10 +425,13 @@ def main(config: _config.TrainConfig):
     # Create optimized training step with compilation cache warming (with fallback)
     if jax_optimizer:
         try:
+            # Create a safe copy of train_state before passing to optimizer
+            safe_train_state = jax.tree_map(lambda x: jax.device_put(x), train_state)
+            
             ptrain_step = jax_optimizer.create_optimized_train_step(
                 train_step_fn=train_step,
                 sample_batch=batch,
-                train_state=train_state,
+                train_state=safe_train_state,  # Use safe copy
                 rng=train_rng,
                 train_config=config,
                 mesh=mesh,
@@ -440,6 +443,8 @@ def main(config: _config.TrainConfig):
         except Exception as e:
             logging.warning(f"Failed to create optimized training step: {e}")
             logging.info("Falling back to standard training step")
+            # Disable JAX optimizer for the rest of training
+            jax_optimizer = None
             ptrain_step = jax.jit(
                 train_step,
                 static_argnums=(0,),
@@ -463,8 +468,23 @@ def main(config: _config.TrainConfig):
     except RuntimeError as e:
         if "Array has been deleted" in str(e):
             logging.error("Train state has been corrupted during JIT compilation. This is likely due to array donation issues.")
-            logging.error("Try disabling JIT warmup with --jit_warmup_iterations 0 or using --optimization_level conservative")
-            raise RuntimeError("Train state corrupted during JIT compilation. Try disabling JIT warmup.") from e
+            logging.error("Attempting to recover by recreating train state...")
+            
+            # Try to recover by recreating train state
+            try:
+                train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+                jax.block_until_ready(train_state)
+                
+                if resuming:
+                    train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+                
+                start_step = int(train_state.step)
+                logging.info(f"Successfully recovered train state. Starting from step {start_step}")
+                
+            except Exception as recovery_error:
+                logging.error(f"Failed to recover train state: {recovery_error}")
+                logging.error("Try disabling JIT warmup with --jit_warmup_iterations 0 or using --optimization_level conservative")
+                raise RuntimeError("Train state corrupted during JIT compilation and recovery failed. Try disabling JIT warmup.") from e
         else:
             raise
     

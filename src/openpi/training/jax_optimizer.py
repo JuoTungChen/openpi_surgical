@@ -394,14 +394,25 @@ class JaxTrainingOptimizer:
         Returns:
             Optimized JIT-compiled training step function
         """
-        # Optimize memory layout of train state
-        optimized_train_state = self.memory_optimizer.optimize_memory_layout(train_state)
+        # Create a deep copy of train_state to avoid any reference issues
+        safe_train_state = jax.tree_map(lambda x: jax.device_put(x), train_state)
+        
+        # Optimize memory layout of train state copy
+        optimized_train_state = self.memory_optimizer.optimize_memory_layout(safe_train_state)
         
         # Optimize sample batch for compilation
         optimized_sample_batch = self.optimize_data_transfer(sample_batch, data_sharding)
         
-        # Create JIT-compiled function with sharding
-        compiled_fn = jax.jit(
+        # Create JIT-compiled function with sharding but WITHOUT donation for warmup
+        warmup_compiled_fn = jax.jit(
+            functools.partial(train_step_fn, train_config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            # No donate_argnums for warmup to avoid consuming train_state
+        )
+        
+        # Create the final compiled function WITH donation for actual training
+        final_compiled_fn = jax.jit(
             functools.partial(train_step_fn, train_config),
             in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
             out_shardings=(train_state_sharding, replicated_sharding),
@@ -416,9 +427,12 @@ class JaxTrainingOptimizer:
             for i in range(self.config.compilation.warmup_iterations):
                 try:
                     logging.info(f"Warmup iteration {i + 1}/{self.config.compilation.warmup_iterations}")
-                    # Create a copy of train_state for warmup to avoid donation issues
-                    warmup_train_state = jax.tree_map(lambda x: x, optimized_train_state)
-                    _, _ = compiled_fn(rng, warmup_train_state, optimized_sample_batch)
+                    # Create a fresh copy for each warmup iteration
+                    warmup_train_state = jax.tree_map(lambda x: jax.device_put(x), optimized_train_state)
+                    warmup_rng = jax.random.split(rng)[0]
+                    
+                    # Use non-donating version for warmup
+                    _, _ = warmup_compiled_fn(warmup_rng, warmup_train_state, optimized_sample_batch)
                     jax.block_until_ready(warmup_train_state)
                     
                 except Exception as e:
@@ -428,7 +442,8 @@ class JaxTrainingOptimizer:
             warmup_time = time.time() - start_time
             logging.info(f"JIT compilation cache warming completed in {warmup_time:.2f}s")
         
-        return compiled_fn
+        # Return the final compiled function with donation for actual training
+        return final_compiled_fn
     
     def setup_multi_gpu_coordination(
         self,
