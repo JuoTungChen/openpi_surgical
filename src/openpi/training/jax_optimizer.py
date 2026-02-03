@@ -416,8 +416,10 @@ class JaxTrainingOptimizer:
             for i in range(self.config.compilation.warmup_iterations):
                 try:
                     logging.info(f"Warmup iteration {i + 1}/{self.config.compilation.warmup_iterations}")
-                    _, _ = compiled_fn(rng, optimized_train_state, optimized_sample_batch)
-                    jax.block_until_ready(optimized_train_state)
+                    # Create a copy of train_state for warmup to avoid donation issues
+                    warmup_train_state = jax.tree_map(lambda x: x, optimized_train_state)
+                    _, _ = compiled_fn(rng, warmup_train_state, optimized_sample_batch)
+                    jax.block_until_ready(warmup_train_state)
                     
                 except Exception as e:
                     logging.warning(f"Warmup iteration {i + 1} failed: {e}")

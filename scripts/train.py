@@ -458,7 +458,16 @@ def main(config: _config.TrainConfig):
         )
         logging.info("Using standard training step (no optimizations)")
 
-    start_step = int(train_state.step)
+    try:
+        start_step = int(train_state.step)
+    except RuntimeError as e:
+        if "Array has been deleted" in str(e):
+            logging.error("Train state has been corrupted during JIT compilation. This is likely due to array donation issues.")
+            logging.error("Try disabling JIT warmup with --jit_warmup_iterations 0 or using --optimization_level conservative")
+            raise RuntimeError("Train state corrupted during JIT compilation. Try disabling JIT warmup.") from e
+        else:
+            raise
+    
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
