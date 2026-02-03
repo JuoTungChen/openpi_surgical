@@ -22,7 +22,11 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.jax_optimizer as _jax_optimizer
+import openpi.training.multi_gpu_coordinator as _multi_gpu
+import openpi.training.optimization_config as _opt_config
 import openpi.training.optimizer as _optimizer
+import openpi.training.performance_integration as _performance
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
@@ -68,6 +72,139 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
+
+
+def create_optimization_configs(config: _config.TrainConfig) -> tuple[
+    _performance.PerformanceIntegrationConfig,
+    _jax_optimizer.JaxOptimizationConfig,
+    _multi_gpu.MultiGPUConfig,
+]:
+    """Create optimization configurations with graceful fallback for disabled features."""
+    
+    # Create comprehensive optimization config from train config
+    try:
+        # Check if user wants to disable all optimizations
+        if getattr(config, 'disable_all_optimizations', False):
+            opt_config = _opt_config.OptimizationConfig()
+            opt_config.disable_all_optimizations()
+            logging.info("All optimizations disabled by user request")
+        else:
+            # Create config based on hardware setup and optimization level
+            hardware_setup = getattr(config, 'hardware_setup', 'auto')
+            opt_config = _opt_config.OptimizationConfig.create_for_hardware_setup(hardware_setup)
+            
+            # Override optimization level if specified
+            optimization_level = getattr(config, 'optimization_level', 'balanced')
+            opt_config.optimization_level = optimization_level
+            
+            # Apply optimization level settings
+            if optimization_level == "conservative":
+                opt_config._apply_conservative_settings()
+            elif optimization_level == "aggressive":
+                opt_config._apply_aggressive_settings()
+            
+            # Override with any explicit train config settings
+            opt_config = _opt_config.create_optimization_config_from_train_config(config)
+            
+            logging.info(f"Created optimization config with level: {opt_config.optimization_level}, setup: {hardware_setup}")
+        
+        # Log effective configuration
+        effective_config = opt_config.get_effective_config_dict()
+        logging.info("Effective optimization configuration:")
+        for key, value in effective_config.items():
+            if isinstance(value, dict):
+                logging.info(f"  {key}:")
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, (bool, int, float, str)):
+                        logging.info(f"    {sub_key}: {sub_value}")
+            else:
+                logging.info(f"  {key}: {value}")
+    
+    except Exception as e:
+        logging.warning(f"Failed to create optimization config, using defaults: {e}")
+        opt_config = _opt_config.OptimizationConfig()
+        opt_config.disable_all_optimizations()
+    
+    # Performance monitoring configuration with graceful fallback
+    try:
+        performance_config = _performance.PerformanceIntegrationConfig(
+            target_gpu_utilization=opt_config.gpu_monitoring.target_gpu_utilization,
+            monitoring_interval=opt_config.gpu_monitoring.monitoring_interval,
+            enable_gpu_monitoring=opt_config.gpu_monitoring.enable_gpu_monitoring,
+            enable_bottleneck_detection=opt_config.gpu_monitoring.enable_bottleneck_detection,
+            enable_automatic_suggestions=opt_config.gpu_monitoring.enable_performance_suggestions,
+            enable_wandb_logging=opt_config.gpu_monitoring.enable_wandb_logging,
+            performance_log_interval=opt_config.gpu_monitoring.performance_log_interval,
+            wandb_log_interval=opt_config.gpu_monitoring.wandb_log_interval,
+        )
+    except Exception as e:
+        logging.warning(f"Failed to create performance config, using defaults: {e}")
+        performance_config = _performance.PerformanceIntegrationConfig(
+            enable_gpu_monitoring=False,
+            enable_bottleneck_detection=False,
+            enable_automatic_suggestions=False,
+            enable_wandb_logging=config.wandb_enabled,
+        )
+    
+    # JAX optimization configuration with graceful fallback
+    try:
+        jax_optimization_config = _jax_optimizer.JaxOptimizationConfig(
+            compilation=_jax_optimizer.CompilationCacheConfig(
+                enable_cache_warming=opt_config.jax_optimization.enable_jit_cache_warming,
+                warmup_iterations=opt_config.jax_optimization.jit_warmup_iterations,
+                persist_cache=opt_config.jax_optimization.jit_cache_persistence,
+                max_cache_size=opt_config.jax_optimization.jit_max_cache_size,
+                log_compilation_timing=opt_config.jax_optimization.log_compilation_timing,
+            ),
+            memory=_jax_optimizer.MemoryOptimizationConfig(
+                enable_memory_optimization=opt_config.jax_optimization.enable_memory_optimization,
+                target_memory_utilization=opt_config.jax_optimization.target_memory_utilization,
+                enable_auto_batch_sizing=opt_config.jax_optimization.enable_auto_batch_sizing,
+                min_batch_size=opt_config.jax_optimization.min_batch_size,
+                max_batch_size=opt_config.jax_optimization.max_batch_size,
+            ),
+            training=_jax_optimizer.TrainingOptimizationConfig(
+                enable_gradient_accumulation=opt_config.jax_optimization.enable_gradient_accumulation,
+                gradient_accumulation_steps=opt_config.jax_optimization.gradient_accumulation_steps,
+                enable_overlapped_computation=opt_config.jax_optimization.enable_overlapped_computation,
+                enable_mixed_precision=opt_config.jax_optimization.enable_mixed_precision,
+                optimize_gradient_sync=opt_config.jax_optimization.optimize_gradient_sync,
+            ),
+        )
+    except Exception as e:
+        logging.warning(f"Failed to create JAX optimization config, using defaults: {e}")
+        jax_optimization_config = _jax_optimizer.JaxOptimizationConfig(
+            compilation=_jax_optimizer.CompilationCacheConfig(enable_cache_warming=False),
+            memory=_jax_optimizer.MemoryOptimizationConfig(enable_memory_optimization=False),
+            training=_jax_optimizer.TrainingOptimizationConfig(
+                enable_gradient_accumulation=False,
+                enable_overlapped_computation=False,
+                enable_mixed_precision=False,
+                optimize_gradient_sync=False,
+            ),
+        )
+    
+    # Multi-GPU configuration with graceful fallback
+    try:
+        multi_gpu_config = _multi_gpu.MultiGPUConfig(
+            fsdp_devices=opt_config.multi_gpu.fsdp_devices,
+            enable_dynamic_device_count=opt_config.multi_gpu.enable_dynamic_device_count,
+            log_sharding_decisions=opt_config.multi_gpu.log_sharding_decisions,
+            enable_load_balancing=opt_config.multi_gpu.enable_load_balancing,
+            communication_backend=opt_config.multi_gpu.communication_backend,
+            min_shard_size_mb=opt_config.multi_gpu.min_shard_size_mb,
+            memory_threshold=opt_config.multi_gpu.memory_threshold,
+        )
+    except Exception as e:
+        logging.warning(f"Failed to create multi-GPU config, using defaults: {e}")
+        multi_gpu_config = _multi_gpu.MultiGPUConfig(
+            fsdp_devices=config.fsdp_devices,
+            enable_dynamic_device_count=False,
+            log_sharding_decisions=False,
+            enable_load_balancing=False,
+        )
+    
+    return performance_config, jax_optimization_config, multi_gpu_config
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -202,6 +339,38 @@ def main(config: _config.TrainConfig):
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
+    # Create optimization configurations with graceful fallback
+    performance_config, jax_optimization_config, multi_gpu_config = create_optimization_configs(config)
+    
+    # Initialize performance monitoring with graceful fallback
+    performance_integrator = None
+    try:
+        performance_integrator = _performance.PerformanceIntegrator(performance_config)
+        performance_integrator.start_monitoring()
+        logging.info("Performance monitoring initialized successfully")
+    except Exception as e:
+        logging.warning(f"Failed to initialize performance monitoring: {e}")
+        logging.info("Continuing without performance monitoring")
+
+    # Initialize JAX optimization with graceful fallback
+    jax_optimizer = None
+    try:
+        jax_optimizer = _jax_optimizer.JaxTrainingOptimizer(jax_optimization_config)
+        logging.info("JAX optimization initialized successfully")
+    except Exception as e:
+        logging.warning(f"Failed to initialize JAX optimization: {e}")
+        logging.info("Continuing without JAX optimizations")
+
+    # Initialize multi-GPU coordinator with graceful fallback
+    multi_gpu_coordinator = None
+    try:
+        if config.fsdp_devices > 1:
+            multi_gpu_coordinator = _multi_gpu.MultiGPUCoordinator(multi_gpu_config)
+            logging.info(f"Multi-GPU coordinator initialized for {config.fsdp_devices} devices")
+    except Exception as e:
+        logging.warning(f"Failed to initialize multi-GPU coordinator: {e}")
+        logging.info("Continuing with standard FSDP sharding")
+
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
 
@@ -217,6 +386,10 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    # Mark data loading start for performance monitoring
+    if performance_integrator:
+        performance_integrator.on_data_loading_start()
+    
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
@@ -224,14 +397,23 @@ def main(config: _config.TrainConfig):
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
+    
+    # Mark data loading end
+    if performance_integrator:
+        performance_integrator.on_data_loading_end()
+    
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    if config.wandb_enabled:
+        try:
+            images_to_log = [
+                wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+                for i in range(min(5, len(next(iter(batch[0].images.values())))))
+            ]
+            wandb.log({"camera_views": images_to_log}, step=0)
+        except Exception as e:
+            logging.warning(f"Failed to log images to wandb: {e}")
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -240,12 +422,41 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
+    # Create optimized training step with compilation cache warming (with fallback)
+    if jax_optimizer:
+        try:
+            ptrain_step = jax_optimizer.create_optimized_train_step(
+                train_step_fn=train_step,
+                sample_batch=batch,
+                train_state=train_state,
+                rng=train_rng,
+                train_config=config,
+                mesh=mesh,
+                train_state_sharding=train_state_sharding,
+                data_sharding=data_sharding,
+                replicated_sharding=replicated_sharding,
+            )
+            logging.info("Using optimized training step")
+        except Exception as e:
+            logging.warning(f"Failed to create optimized training step: {e}")
+            logging.info("Falling back to standard training step")
+            ptrain_step = jax.jit(
+                train_step,
+                static_argnums=(0,),
+                in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+                out_shardings=(train_state_sharding, replicated_sharding),
+                donate_argnums=(1,),
+            )
+    else:
+        # Fallback to standard JIT compilation
+        ptrain_step = jax.jit(
+            train_step,
+            static_argnums=(0,),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
+        logging.info("Using standard training step (no optimizations)")
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -256,21 +467,120 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
-    for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
+    try:
+        for step in pbar:
+            # Mark training step start for performance monitoring
+            if performance_integrator:
+                performance_integrator.on_training_step_start(step)
+            
+            # Mark data loading start
+            if performance_integrator:
+                performance_integrator.on_data_loading_start()
+            batch = next(data_iter)
+            
+            # Optimize data transfer for better memory efficiency (with fallback)
+            if jax_optimizer:
+                try:
+                    batch = jax_optimizer.optimize_data_transfer(batch, data_sharding)
+                except Exception as e:
+                    logging.warning(f"Data transfer optimization failed: {e}")
+            
+            if performance_integrator:
+                performance_integrator.on_data_loading_end()
+            
+            # Mark computation start
+            if performance_integrator:
+                performance_integrator.on_computation_start()
+            
+            with sharding.set_mesh(mesh):
+                train_state, info = ptrain_step(config, train_rng, train_state, batch)
+            
+            # Mark computation end
+            if performance_integrator:
+                performance_integrator.on_computation_end()
+            
+            infos.append(info)
+            
+            # Handle logging
+            if step % config.log_interval == 0:
+                stacked_infos = common_utils.stack_forest(infos)
+                reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                if config.wandb_enabled:
+                    wandb.log(reduced_info, step=step)
+                infos = []
+            
+            # Performance monitoring step end
+            if performance_integrator:
+                step_info = {"loss": float(info.get("loss", 0)), "grad_norm": float(info.get("grad_norm", 0))}
+                performance_integrator.on_training_step_end(step, step_info)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            # Memory monitoring and optimization (with fallback)
+            if jax_optimizer and step % (config.log_interval * 5) == 0:  # Check memory every 5 log intervals
+                try:
+                    is_memory_safe, memory_info = jax_optimizer.memory_optimizer.check_memory_usage(config.batch_size)
+                    
+                    if not is_memory_safe:
+                        logging.warning(f"High memory usage detected: {memory_info.get('max_utilization', 0):.2%}")
+                        
+                        if getattr(config, 'enable_auto_batch_sizing', False):
+                            suggested_batch_size = jax_optimizer.memory_optimizer.suggest_batch_size(
+                                config.batch_size, memory_info
+                            )
+                            if suggested_batch_size and suggested_batch_size != config.batch_size:
+                                logging.info(f"Suggested batch size adjustment: {config.batch_size} -> {suggested_batch_size}")
+                    
+                    # Log memory stats to wandb
+                    if config.wandb_enabled and step % config.log_interval == 0:
+                        memory_log = {
+                            f"memory/{k}": v for k, v in memory_info.items() 
+                            if isinstance(v, (int, float))
+                        }
+                        wandb.log(memory_log, step=step)
+                except Exception as e:
+                    logging.warning(f"Memory monitoring failed: {e}")
+
+            if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+
+    finally:
+        # Stop performance monitoring
+        if performance_integrator:
+            try:
+                performance_integrator.stop_monitoring()
+                
+                # Log final performance summary
+                final_summary = performance_integrator.get_performance_summary()
+                logging.info("=== Final Performance Summary ===")
+                for key, value in final_summary.items():
+                    if isinstance(value, (int, float)):
+                        logging.info(f"{key}: {value}")
+                logging.info("=" * 40)
+            except Exception as e:
+                logging.warning(f"Failed to get performance summary: {e}")
+        
+        # Log JAX optimization statistics
+        if jax_optimizer:
+            try:
+                jax_stats = jax_optimizer.get_optimization_stats()
+                logging.info("=== JAX Optimization Summary ===")
+                compilation_stats = jax_stats.get("compilation", {})
+                if compilation_stats:
+                    logging.info(f"Cached functions: {compilation_stats.get('cached_functions', [])}")
+                    logging.info(f"Total compilation time: {compilation_stats.get('total_compilation_time', 0):.2f}s")
+                    logging.info(f"Cache size: {compilation_stats.get('cache_size', 0)}")
+                
+                training_stats = jax_stats.get("training", {})
+                if training_stats:
+                    logging.info(f"Gradient accumulation: {training_stats.get('gradient_accumulation_enabled', False)}")
+                    if training_stats.get('gradient_accumulation_enabled'):
+                        logging.info(f"Accumulation steps: {training_stats.get('gradient_accumulation_steps', 1)}")
+                    logging.info(f"Overlapped computation: {training_stats.get('overlapped_computation_enabled', False)}")
+                    logging.info(f"Mixed precision: {training_stats.get('mixed_precision_enabled', False)}")
+                logging.info("=" * 40)
+            except Exception as e:
+                logging.warning(f"Failed to get JAX optimization stats: {e}")
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

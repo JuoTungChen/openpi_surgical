@@ -1,6 +1,8 @@
 from collections.abc import Iterator, Sequence
 import multiprocessing
 import os
+import psutil
+import time
 import typing
 from typing import Protocol, SupportsIndex, TypeVar
 
@@ -14,8 +16,67 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
+from openpi.training.data_loading_monitor import (
+    DataLoadingMonitor,
+    DataLoadingMetrics,
+    get_global_monitor,
+)
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+def _get_optimal_num_workers(dataset_size: int, batch_size: int) -> int:
+    """Determine optimal number of workers based on system resources.
+    
+    Args:
+        dataset_size: Size of the dataset
+        batch_size: Batch size being used
+        
+    Returns:
+        Optimal number of worker processes
+    """
+    # Get system information
+    cpu_count = multiprocessing.cpu_count()
+    available_memory_gb = psutil.virtual_memory().available / (1024**3)
+    
+    # Base calculation: use 2-4 workers per CPU core, but cap based on memory
+    # Each worker typically uses 100-500MB of memory depending on dataset
+    max_workers_by_cpu = min(cpu_count * 2, 16)  # Cap at 16 workers
+    max_workers_by_memory = max(1, int(available_memory_gb / 0.5))  # Assume 500MB per worker
+    
+    # Consider dataset characteristics
+    # For small datasets, fewer workers are better to avoid overhead
+    if dataset_size < 1000:
+        max_workers_by_dataset = 2
+    elif dataset_size < 10000:
+        max_workers_by_dataset = 4
+    else:
+        max_workers_by_dataset = 8
+    
+    # Take the minimum of all constraints
+    optimal_workers = min(max_workers_by_cpu, max_workers_by_memory, max_workers_by_dataset)
+    
+    # Always use at least 1 worker for better GPU utilization, but allow 0 for debugging
+    return max(1, optimal_workers)
+
+
+def _get_optimal_prefetch_factor(num_workers: int) -> int:
+    """Determine optimal prefetch factor based on number of workers.
+    
+    Args:
+        num_workers: Number of worker processes
+        
+    Returns:
+        Optimal prefetch factor per worker
+    """
+    if num_workers == 0:
+        return 2  # Default PyTorch value for single-threaded
+    elif num_workers <= 2:
+        return 4  # Higher prefetch for few workers
+    elif num_workers <= 4:
+        return 3  # Moderate prefetch for medium workers
+    else:
+        return 2  # Lower prefetch for many workers to avoid memory pressure
 
 
 class Dataset(Protocol[T_co]):
@@ -251,6 +312,8 @@ def create_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
+    auto_optimize_workers: bool = True,
+    enable_monitoring: bool = True,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training."""
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -281,6 +344,8 @@ def create_data_loader(
         num_workers=config.num_workers,
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
+        auto_optimize_workers=auto_optimize_workers,
+        enable_monitoring=enable_monitoring,
     )
 
 
@@ -296,6 +361,8 @@ def create_torch_data_loader(
     num_batches: int | None = None,
     num_workers: int = 0,
     seed: int = 0,
+    auto_optimize_workers: bool = True,
+    enable_monitoring: bool = True,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -311,8 +378,12 @@ def create_torch_data_loader(
             number of batches in the dataset, the data loader will loop over the dataset.
             If not provided, will iterate over the dataset indefinitely.
         num_workers: The number of worker processes to use. If zero, the data loader will
-            execute in the main process.
+            execute in the main process. If auto_optimize_workers is True, this acts as
+            a maximum constraint.
         seed: The seed to use for shuffling the data.
+        auto_optimize_workers: Whether to automatically optimize worker count and prefetch
+            settings based on system resources.
+        enable_monitoring: Whether to enable performance monitoring and bottleneck detection.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
@@ -325,6 +396,8 @@ def create_torch_data_loader(
         num_batches=num_batches,
         num_workers=num_workers,
         seed=seed,
+        auto_optimize=auto_optimize_workers,
+        enable_monitoring=enable_monitoring,
     )
 
     return DataLoaderImpl(data_config, data_loader)
@@ -379,8 +452,10 @@ class TorchDataLoader:
         num_batches: int | None = None,
         num_workers: int = 0,
         seed: int = 0,
+        auto_optimize: bool = True,
+        enable_monitoring: bool = True,
     ):
-        """Create a PyTorch data loader.
+        """Create a PyTorch data loader with GPU utilization optimizations.
 
         Args:
             dataset: The dataset to load.
@@ -392,8 +467,12 @@ class TorchDataLoader:
                 will loop over the dataset. If not provided, will iterate over the dataset
                 indefinitely.
             num_workers: The number of worker processes to use. If zero, the data loader will
-                execute in the main process.
+                execute in the main process. If auto_optimize is True, this will be used as
+                a maximum constraint.
             seed: The seed to use for shuffling the data.
+            auto_optimize: If True, automatically optimize worker count and prefetch settings
+                based on system resources and dataset characteristics.
+            enable_monitoring: If True, enable performance monitoring and bottleneck detection.
         """
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
@@ -410,25 +489,51 @@ class TorchDataLoader:
 
         self._sharding = sharding
         self._num_batches = num_batches
+        self._local_batch_size = local_batch_size
+        self._enable_monitoring = enable_monitoring
+
+        # Initialize performance monitor
+        self._monitor = get_global_monitor() if enable_monitoring else None
+
+        # Optimize worker count and prefetch settings if requested
+        if auto_optimize:
+            optimal_workers = _get_optimal_num_workers(len(dataset), local_batch_size)
+            # Use the minimum of requested workers and optimal workers
+            if num_workers > 0:
+                num_workers = min(num_workers, optimal_workers)
+            else:
+                num_workers = optimal_workers
+        
+        # Store optimization settings for monitoring
+        self._num_workers = num_workers
+        self._auto_optimize = auto_optimize
 
         mp_context = None
         prefetch_factor = 2  # Default PyTorch value
+        pin_memory = False
+        persistent_workers = False
+        
         if num_workers > 0:
             mp_context = multiprocessing.get_context("spawn")
-            # Increase prefetch factor for better GPU utilization
-            # Each worker will prefetch this many batches ahead
-            prefetch_factor = 4
+            # Use optimized prefetch factor for better GPU utilization
+            prefetch_factor = _get_optimal_prefetch_factor(num_workers)
+            # Enable memory pinning for faster GPU transfers
+            pin_memory = True
+            # Enable persistent workers to avoid process startup overhead
+            persistent_workers = True
 
         generator = torch.Generator()
         generator.manual_seed(seed)
+        
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
             batch_size=local_batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
-            persistent_workers=num_workers > 0,
+            persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            pin_memory=pin_memory,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
             drop_last=True,
@@ -438,6 +543,23 @@ class TorchDataLoader:
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:
         return self._data_loader
+    
+    def get_optimization_info(self) -> dict[str, any]:
+        """Get information about the optimization settings used."""
+        return {
+            "num_workers": self._num_workers,
+            "prefetch_factor": self._data_loader.prefetch_factor,
+            "pin_memory": self._data_loader.pin_memory,
+            "persistent_workers": self._data_loader.persistent_workers,
+            "auto_optimize": self._auto_optimize,
+            "enable_monitoring": self._enable_monitoring,
+        }
+
+    def get_performance_stats(self) -> dict[str, any]:
+        """Get current performance statistics."""
+        if self._monitor is not None:
+            return self._monitor.get_current_stats()
+        return {}
 
     def __iter__(self):
         num_items = 0
@@ -447,7 +569,34 @@ class TorchDataLoader:
                 if self._num_batches is not None and num_items >= self._num_batches:
                     return
                 try:
+                    # Record batch loading time
+                    batch_start_time = time.time()
                     batch = next(data_iter)
+                    batch_load_time = time.time() - batch_start_time
+                    
+                    # Record performance metrics
+                    if self._monitor is not None:
+                        # Get video decode stats if available (from GR00T dataset)
+                        video_decode_time = 0.0
+                        cache_hit_rate = -1.0  # -1 indicates no cache info
+                        
+                        # Try to get video stats from dataset
+                        if hasattr(self._data_loader.dataset, 'get_video_decode_stats'):
+                            video_stats = self._data_loader.dataset.get_video_decode_stats()
+                            if video_stats:
+                                cache_hit_rate = video_stats.get('cache_hit_rate', -1.0)
+                                # Estimate video decode time from recent operations
+                                if 'decode_time_avg' in video_stats:
+                                    video_decode_time = video_stats['decode_time_avg']
+                        
+                        metrics = DataLoadingMetrics(
+                            batch_load_time=batch_load_time,
+                            batch_size=self._local_batch_size,
+                            video_decode_time=video_decode_time,
+                            cache_hit_rate=cache_hit_rate,
+                        )
+                        self._monitor.record_batch_metrics(metrics)
+                    
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1

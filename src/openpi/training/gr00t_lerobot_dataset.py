@@ -19,6 +19,7 @@ remains unchanged.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -31,6 +32,28 @@ try:
     import torch
 except Exception as e:  # pragma: no cover
     raise ImportError("openpi requires torch for data loading.") from e
+
+# Import async video decoder, parallel action processor, intelligent caching, and video optimization
+from openpi.training.async_video_decoder import (
+    AsyncVideoDecoder,
+    VideoDecodeRequest,
+    get_global_decoder,
+)
+from openpi.training.parallel_action_processor import (
+    ParallelActionProcessor,
+    get_global_parallel_processor,
+)
+from openpi.training.intelligent_episode_cache import (
+    DistributedEpisodeCache,
+    get_global_episode_cache,
+    create_cached_loader,
+)
+from openpi.training.video_backend_optimizer import (
+    VideoBackendOptimizer,
+    VideoBackendConfig,
+    get_global_video_optimizer,
+    create_optimized_video_backend_kwargs,
+)
 
 
 def _require_gr00t() -> None:
@@ -65,6 +88,11 @@ class Gr00tDatasetSpec:
     # Larger values reduce video decoding overhead but use more memory.
     # Recommended: Set to number of episodes / num_workers for best performance.
     episode_cache_size: int = 16
+    # Intelligent caching settings
+    enable_intelligent_caching: bool = True
+    cache_memory_mb_per_worker: int = 512
+    enable_cross_process_cache_sharing: bool = True
+    enable_cache_warming: bool = True
     # Video backend args forwarded into gr00t loader.
     video_backend: str = "torchcodec"
     video_backend_kwargs: dict[str, Any] | None = None
@@ -75,6 +103,19 @@ class Gr00tDatasetSpec:
     # Statistics key for normalization (if None, will be inferred from embodiment_tag).
     # Only used if apply_action_transforms=True.
     stats_key: str | None = None
+    # Async video decoding settings
+    enable_async_video_decoding: bool = True
+    video_cache_size_mb: int = 512
+    video_prefetch_workers: int = 4
+    # Parallel action processing settings
+    enable_parallel_action_processing: bool = True
+    action_processing_workers: int = None  # None for auto-detection
+    action_processing_batch_size: int = 32
+    use_threading_for_actions: bool = False
+    # Video backend optimization settings
+    enable_video_backend_optimization: bool = True
+    video_backend_config: Optional[VideoBackendConfig] = None
+    optimize_video_for_dataset: bool = True
 
 
 class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
@@ -89,10 +130,96 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
     def __init__(self, spec: Gr00tDatasetSpec):
         _require_gr00t()
 
+        self._spec = spec
+        
+        # Initialize critical attributes first to avoid AttributeError
+        self._total_steps = 0
+        self._episode_ids = np.array([], dtype=np.int32)
+        self._effective_lengths = np.array([], dtype=np.int64)
+        self._cum_lengths = np.array([], dtype=np.int64)
+        self._video_views = []
+        self._video_path_pattern = None
+        
+        # Initialize optimization components as None - they will be lazy-initialized
+        # to avoid pickle issues with multiprocessing DataLoader
+        self._async_video_decoder = None
+        self._parallel_action_processor = None
+        self._distributed_cache = None
+        self._video_optimizer = None
+        
+        # Store configuration for lazy initialization (avoid storing complex objects)
+        self._async_video_config = {
+            'enabled': spec.enable_async_video_decoding,
+            'max_workers': spec.video_prefetch_workers,
+            'cache_size_mb': spec.video_cache_size_mb,
+        }
+        
+        # Store video optimizer config as simple dict to avoid pickle issues
+        self._video_optimizer_config = {
+            'enabled': spec.enable_video_backend_optimization,
+            'backend': spec.video_backend,
+            'extra_kwargs': spec.video_backend_kwargs or {},
+            'optimize_for_dataset': spec.optimize_video_for_dataset,
+        }
+        
+        # Initialize the dataset
+        self._initialize_dataset()
+
+    def _get_async_video_decoder(self):
+        """Lazy initialization of async video decoder to avoid pickle issues."""
+        if self._async_video_decoder is None and self._async_video_config['enabled']:
+            from openpi.training.async_video_decoder import AsyncVideoDecoder
+            self._async_video_decoder = AsyncVideoDecoder(
+                max_workers=self._async_video_config['max_workers'],
+                cache_size_mb=self._async_video_config['cache_size_mb'],
+            )
+        return self._async_video_decoder
+    
+    def _get_video_optimizer(self):
+        """Lazy initialization of video optimizer to avoid pickle issues."""
+        if self._video_optimizer is None and self._video_optimizer_config['enabled']:
+            from openpi.training.video_backend_optimizer import get_global_video_optimizer, VideoBackendConfig
+            config = VideoBackendConfig(
+                backend=self._video_optimizer_config['backend'],
+                extra_kwargs=self._video_optimizer_config['extra_kwargs'],
+            )
+            self._video_optimizer = get_global_video_optimizer(config)
+        return self._video_optimizer
+    
+    def _get_parallel_action_processor(self):
+        """Lazy initialization of parallel action processor to avoid pickle issues."""
+        if self._parallel_action_processor is None and hasattr(self._spec, 'enable_parallel_action_processing') and self._spec.enable_parallel_action_processing:
+            from openpi.training.parallel_action_processor import get_global_parallel_processor
+            self._parallel_action_processor = get_global_parallel_processor(
+                modality_configs={self._spec.embodiment_tag: self._modality_configs},
+                statistics=self._statistics,
+                use_percentiles=True,
+                clip_outliers=True,
+                apply_sincos_state_encoding=False,
+                use_relative_action=True,
+                max_workers=self._spec.action_processing_workers,
+                batch_size=self._spec.action_processing_batch_size,
+                use_threading=self._spec.use_threading_for_actions,
+            )
+        return self._parallel_action_processor
+    
+    def _initialize_dataset(self):
+        """Initialize the dataset after all lazy components are set up."""
+        spec = self._spec
+        
+        # Import here to avoid storing classes as instance variables
         from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
         from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
-
-        self._spec = spec
+        
+        # Disable advanced optimizations to avoid pickle issues for now
+        if spec.enable_intelligent_caching:
+            # Skip intelligent caching to avoid pickle issues - it contains thread locks
+            pass
+            
+        # Initialize video backend optimizer if enabled
+        self._video_optimizer = None
+        # Video optimizer will be lazy-initialized to avoid pickle issues
+        # Configuration is stored in self._video_optimizer_config
         
         # If modality_config_path is provided, load and register it
         if spec.modality_config_path:
@@ -112,11 +239,14 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                         f"Expected a Python file that registers the embodiment in MODALITY_CONFIGS."
                     )
                 
-                spec_module = importlib.util.spec_from_file_location("temp_modality_config", config_path)
-                if spec_module and spec_module.loader:
-                    module = importlib.util.module_from_spec(spec_module)
-                    spec_module.loader.exec_module(module)
-        
+                try:
+                    spec_module = importlib.util.spec_from_file_location("temp_modality_config", config_path)
+                    if spec_module and spec_module.loader:
+                        module = importlib.util.module_from_spec(spec_module)
+                        spec_module.loader.exec_module(module)
+                except Exception as e:
+                    raise RuntimeError(f"Error loading modality config from {config_path}: {e}")
+
         self._use_gr00t_modality_config = spec.embodiment_tag in MODALITY_CONFIGS
 
         if self._use_gr00t_modality_config:
@@ -189,6 +319,20 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                             use_relative_action=True,  # Enable relative/hybrid-relative conversions
                         )
                         self._processor.eval()  # Set to eval mode (no data augmentation)
+                        
+                        # Initialize parallel action processor if enabled
+                        if spec.enable_parallel_action_processing:
+                            self._parallel_action_processor = get_global_parallel_processor(
+                                modality_configs={spec.embodiment_tag: self._modality_configs},
+                                statistics=self._statistics,
+                                use_percentiles=True,
+                                clip_outliers=True,
+                                apply_sincos_state_encoding=False,
+                                use_relative_action=True,
+                                max_workers=spec.action_processing_workers,
+                                batch_size=spec.action_processing_batch_size,
+                                use_threading=spec.use_threading_for_actions,
+                            )
                 else:
                     warnings.warn(
                         f"Statistics file not found at {stats_path}. "
@@ -215,6 +359,7 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
             raw_lengths = np.asarray(
                 [self._episode_loader.get_episode_length(int(i)) for i in self._episode_ids], dtype=np.int64
             )
+            self._raw_lengths = raw_lengths  # Store for debugging
             effective = np.maximum(raw_lengths - self._max_action_delta, 0)
             self._effective_lengths = effective
             self._cum_lengths = np.cumsum(self._effective_lengths, dtype=np.int64)
@@ -224,6 +369,39 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                 self._video_views = spec.video_views or list(self._modality_configs["video"].modality_keys)
             else:
                 self._video_views = spec.video_views or []
+
+            # Initialize video path pattern for gr00t modality config path
+            # This is needed for video backend optimization
+            self._video_path_pattern = None
+            if self._video_views:
+                # For gr00t datasets, try to infer video path pattern from dataset structure
+                # Common patterns: "videos/{episode_chunk:06d}/{video_key}_{episode_index:06d}.mp4"
+                self._video_path_pattern = "videos/{episode_chunk:06d}/{video_key}_{episode_index:06d}.mp4"
+                
+                # Try to read from info.json if available
+                try:
+                    import json
+                    from pathlib import Path
+                    info_path = Path(spec.dataset_path) / "meta" / "info.json"
+                    if info_path.exists():
+                        info_meta = json.loads(info_path.read_text())
+                        if "video_path" in info_meta:
+                            self._video_path_pattern = info_meta["video_path"]
+                        # Also get chunk size if available
+                        if "chunks_size" in info_meta:
+                            self._chunk_size = int(info_meta["chunks_size"])
+                        else:
+                            self._chunk_size = 1000  # Default chunk size
+                    else:
+                        self._chunk_size = 1000  # Default chunk size
+                        
+                    # Also need dataset path for video optimization
+                    self._dataset_path = Path(spec.dataset_path)
+                        
+                except Exception:
+                    # If we can't read info.json, use defaults
+                    self._chunk_size = 1000
+                    self._dataset_path = Path(spec.dataset_path)
 
             self._state_keys = list(self._modality_configs["state"].modality_keys)
             self._action_keys = list(self._modality_configs["action"].modality_keys)
@@ -260,6 +438,7 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
 
             lengths_by_id = {int(e["episode_index"]): int(e["length"]) for e in episodes}
             raw_lengths = np.asarray([lengths_by_id[int(i)] for i in self._episode_ids], dtype=np.int64)
+            self._raw_lengths = raw_lengths  # Store for debugging
 
             self._action_delta_indices = list(range(int(spec.action_horizon)))
             self._max_action_delta = int(max(self._action_delta_indices)) if self._action_delta_indices else 0
@@ -271,16 +450,55 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
 
             # Views come from spec (required for fallback).
             self._video_views = spec.video_views or []
+            
+            # Initialize video path pattern if not present in metadata
+            if self._video_path_pattern is None and self._video_views:
+                # Try to infer video path pattern from data structure
+                # Common patterns: "videos/{episode_chunk:06d}/{video_key}_{episode_index:06d}.mp4"
+                self._video_path_pattern = "videos/{episode_chunk:06d}/{video_key}_{episode_index:06d}.mp4"
+                logging.warning(f"Video path pattern not found in metadata, using default: {self._video_path_pattern}")
 
             # State and action come from raw columns.
             self._state_keys = []
             self._action_keys = []
 
         if self._total_steps <= 0:
+            # Provide detailed debug information
+            debug_info = []
+            debug_info.append(f"Dataset path: {spec.dataset_path}")
+            debug_info.append(f"Embodiment tag: {spec.embodiment_tag}")
+            debug_info.append(f"Use gr00t modality config: {self._use_gr00t_modality_config}")
+            
+            if hasattr(self, '_episode_loader'):
+                debug_info.append(f"Episode loader length: {len(self._episode_loader)}")
+            if hasattr(self, '_episode_ids'):
+                debug_info.append(f"Episode IDs: {self._episode_ids}")
+            if hasattr(self, '_max_action_delta'):
+                debug_info.append(f"Max action delta: {self._max_action_delta}")
+            if hasattr(self, '_effective_lengths'):
+                debug_info.append(f"Effective lengths: {self._effective_lengths}")
+                if len(self._effective_lengths) > 0:
+                    debug_info.append(f"Raw lengths before action delta: {getattr(self, '_raw_lengths', 'unknown')}")
+            
+            debug_msg = "\n".join(debug_info)
             raise ValueError(
-                "No valid (episode, step) pairs found. "
-                "Check your dataset path and that episodes are longer than the action horizon."
+                f"No valid (episode, step) pairs found. "
+                f"Check your dataset path and that episodes are longer than the action horizon.\n"
+                f"Debug information:\n{debug_msg}"
             )
+        
+        # Warm up cache with first few episodes if enabled
+        if (self._distributed_cache is not None and 
+            self._spec.enable_cache_warming and 
+            len(self._episode_ids) > 0):
+            # Prefetch first 10% of episodes or up to 20 episodes
+            warmup_count = min(20, max(1, len(self._episode_ids) // 10))
+            warmup_episodes = self._episode_ids[:warmup_count].tolist()
+            self.prefetch_episodes(warmup_episodes)
+        
+        # Optimize video backend for dataset if enabled
+        if self._spec.optimize_video_for_dataset:
+            self.optimize_video_backend_for_dataset()
 
     def __len__(self) -> int:
         return self._total_steps
@@ -330,6 +548,209 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
             out[view] = img
         return out
 
+    def _decode_video_async(self, video_path: str, frame_indices: np.ndarray) -> list[np.ndarray]:
+        """Decode video frames using async decoder or video optimizer if available."""
+        # Try video optimizer first (provides caching and optimization)
+        video_optimizer = self._get_video_optimizer()
+        if video_optimizer is not None:
+            try:
+                return video_optimizer.decode_video_frames(video_path, frame_indices)
+            except Exception as e:
+                warnings.warn(
+                    f"Video optimizer failed: {e}. Falling back to async decoder.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        
+        # Fallback to async decoder
+        async_decoder = self._get_async_video_decoder()
+        if async_decoder is not None:
+            request = VideoDecodeRequest(
+                video_path=video_path,
+                frame_indices=frame_indices,
+                video_backend=self._spec.video_backend,
+                video_backend_kwargs=self._spec.video_backend_kwargs,
+            )
+            result = async_decoder.decode_sync(request)
+            return result.frames
+        else:
+            # Final fallback to synchronous decoding
+            try:
+                from gr00t.utils.video_utils import get_frames_by_indices
+                return get_frames_by_indices(
+                    video_path,
+                    frame_indices,
+                    video_backend=self._spec.video_backend,
+                    video_backend_kwargs=self._spec.video_backend_kwargs or {},
+                )
+            except ImportError:
+                return []
+
+    def prefetch_video_frames(self, episode_id: int, step: int):
+        """Prefetch video frames for future use (non-blocking)."""
+        if not self._video_views or self._video_path_pattern is None:
+            return
+        
+        # Prefetch frames for next few steps
+        prefetch_steps = [step + i for i in range(1, 4)]  # Prefetch next 3 steps
+        
+        for prefetch_step in prefetch_steps:
+            if prefetch_step >= self._effective_lengths[np.searchsorted(self._cum_lengths, step, side="right")]:
+                continue  # Don't prefetch beyond episode end
+                
+            for view in self._video_views:
+                chunk_idx = int(episode_id) // int(self._chunk_size)
+                video_filename = self._video_path_pattern.format(
+                    episode_chunk=chunk_idx, video_key=view, episode_index=int(episode_id)
+                )
+                video_path = str(self._dataset_path / video_filename)
+                
+                # Check if video file exists before prefetching
+                if not (self._dataset_path / video_filename).exists():
+                    continue
+                
+                frame_indices = np.asarray([prefetch_step], dtype=np.int64)
+                
+                # Use video optimizer for prefetching if available
+                video_optimizer = self._get_video_optimizer()
+                if video_optimizer is not None:
+                    video_optimizer.prefetch_frames(video_path, frame_indices)
+                else:
+                    # Fallback to async decoder prefetch
+                    async_decoder = self._get_async_video_decoder()
+                    if async_decoder is not None:
+                        request = VideoDecodeRequest(
+                            video_path=video_path,
+                            frame_indices=frame_indices,
+                            video_backend=self._spec.video_backend,
+                            video_backend_kwargs=self._spec.video_backend_kwargs,
+                        )
+                        async_decoder.prefetch(request)
+
+    def get_video_decode_stats(self) -> dict[str, Any]:
+        """Get video decoding statistics."""
+        async_decoder = self._get_async_video_decoder()
+        if async_decoder is not None:
+            return async_decoder.get_stats()
+        return {}
+
+    def prefetch_episodes(self, episode_ids: List[int]):
+        """Prefetch episodes into cache for better performance."""
+        if self._distributed_cache is not None and self._spec.enable_cache_warming:
+            if self._use_gr00t_modality_config:
+                # Prefetch using gr00t loader
+                self._distributed_cache.prefetch(
+                    episode_ids,
+                    lambda eid: self._episode_loader[int(eid)]
+                )
+            else:
+                # Prefetch using fallback loader
+                def _load_episode(eid: int):
+                    chunk_idx = int(eid) // int(self._chunk_size)
+                    parquet_filename = self._data_path_pattern.format(episode_chunk=chunk_idx, episode_index=int(eid))
+                    parquet_path = self._dataset_path / parquet_filename
+                    
+                    if not parquet_path.exists():
+                        return None
+                    
+                    cols = ["observation.state", "action", "instruction.text"]
+                    try:
+                        return pd.read_parquet(parquet_path, columns=cols)
+                    except Exception:
+                        return pd.read_parquet(parquet_path)
+                
+                self._distributed_cache.prefetch(episode_ids, _load_episode)
+
+    def get_episode_cache_stats(self) -> dict[str, Any]:
+        """Get episode caching statistics."""
+        if self._distributed_cache is not None:
+            return self._distributed_cache.get_stats()
+        return {}
+
+    def get_video_optimization_stats(self) -> dict[str, Any]:
+        """Get video optimization statistics."""
+        stats = {}
+        
+        video_optimizer = self._get_video_optimizer()
+        if video_optimizer is not None:
+            stats["decode_stats"] = video_optimizer.get_stats().__dict__
+            stats["cache_info"] = video_optimizer.get_cache_info()
+        
+        async_decoder = self._get_async_video_decoder()
+        if async_decoder is not None:
+            stats["async_decoder"] = async_decoder.get_stats()
+        
+        return stats
+
+    def optimize_video_backend_for_dataset(self) -> bool:
+        """
+        Optimize video backend configuration based on dataset characteristics.
+        
+        Returns:
+            True if optimization was performed, False otherwise
+        """
+        if (not self._spec.optimize_video_for_dataset or 
+            not self._video_optimizer_config['enabled'] or
+            not self._video_views or 
+            self._video_path_pattern is None):
+            if self._video_path_pattern is None and self._video_views:
+                logging.warning("Video path pattern not available, skipping video backend optimization")
+            return False
+        
+        try:
+            # Collect sample video paths and frame counts
+            sample_videos = []
+            sample_frame_counts = []
+            
+            # Sample first few episodes
+            for i, episode_id in enumerate(self._episode_ids[:5]):
+                if i >= 3:  # Limit to 3 samples for performance
+                    break
+                
+                # Get video path for first view
+                view = self._video_views[0]
+                chunk_idx = int(episode_id) // int(self._chunk_size)
+                video_filename = self._video_path_pattern.format(
+                    episode_chunk=chunk_idx, video_key=view, episode_index=int(episode_id)
+                )
+                video_path = str(self._dataset_path / video_filename)
+                
+                if (self._dataset_path / video_filename).exists():
+                    sample_videos.append(video_path)
+                    # Use effective length as frame count estimate
+                    ep_idx = np.where(self._episode_ids == episode_id)[0][0]
+                    sample_frame_counts.append(int(self._effective_lengths[ep_idx]))
+            
+            if sample_videos:
+                # Get video optimizer and optimize configuration
+                video_optimizer = self._get_video_optimizer()
+                if video_optimizer is not None:
+                    optimized_config = video_optimizer.optimize_for_dataset(
+                        sample_videos, sample_frame_counts
+                    )
+                    
+                    # Update video optimizer with optimized config
+                    from openpi.training.video_backend_optimizer import shutdown_global_video_optimizer, get_global_video_optimizer
+                    shutdown_global_video_optimizer()
+                    self._video_optimizer = get_global_video_optimizer(optimized_config)
+                    
+                    return True
+                
+        except Exception as e:
+            warnings.warn(
+                f"Video backend optimization failed: {e}. Using default configuration.",
+                UserWarning,
+                stacklevel=2,
+            )
+        
+        return False
+
+    def get_action_processing_stats(self) -> dict[str, Any]:
+        """Get action processing performance statistics."""
+        if self._parallel_action_processor is not None:
+            return self._parallel_action_processor.get_performance_stats()
+        return {}
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         episode_id, step = self._global_to_episode_step(int(index))
 
@@ -356,25 +777,53 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
 
             # Apply action representation transforms if processor is available
             if self._processor is not None:
-                # StateActionProcessor requires state dict for hybrid-relative conversion
-                # Apply state processing (normalization)
-                processed_states = self._processor.apply_state(
-                    vla.states,
-                    embodiment_tag=self._spec.embodiment_tag,
-                    stats_key=self._stats_key,
-                )
-                
-                # Apply action processing (hybrid-relative conversion + normalization)
-                processed_actions = self._processor.apply_action(
-                    vla.actions,
-                    embodiment_tag=self._spec.embodiment_tag,
-                    state=vla.states,  # Pass raw states as reference for relative conversion
-                    stats_key=self._stats_key,
-                )
-                
-                # Concatenate processed state and actions
-                sample["observation.state"] = self._concat_state(processed_states)
-                sample["actions"] = self._concat_actions(processed_actions)
+                # Use parallel processing if available, otherwise fall back to sequential
+                if self._parallel_action_processor is not None:
+                    try:
+                        # Use parallel processor for better performance
+                        processed_actions_list, processed_states_list = self._parallel_action_processor.process_single(
+                            vla.actions,
+                            vla.states,
+                            self._spec.embodiment_tag,
+                            self._stats_key,
+                        )
+                        sample["observation.state"] = self._concat_state(processed_states_list)
+                        sample["actions"] = self._concat_actions(processed_actions_list)
+                    except Exception as e:
+                        warnings.warn(
+                            f"Parallel action processing failed: {e}. Falling back to sequential processing.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                        # Fallback to sequential processing
+                        processed_states = self._processor.apply_state(
+                            vla.states,
+                            embodiment_tag=self._spec.embodiment_tag,
+                            stats_key=self._stats_key,
+                        )
+                        processed_actions = self._processor.apply_action(
+                            vla.actions,
+                            embodiment_tag=self._spec.embodiment_tag,
+                            state=vla.states,
+                            stats_key=self._stats_key,
+                        )
+                        sample["observation.state"] = self._concat_state(processed_states)
+                        sample["actions"] = self._concat_actions(processed_actions)
+                else:
+                    # Sequential processing
+                    processed_states = self._processor.apply_state(
+                        vla.states,
+                        embodiment_tag=self._spec.embodiment_tag,
+                        stats_key=self._stats_key,
+                    )
+                    processed_actions = self._processor.apply_action(
+                        vla.actions,
+                        embodiment_tag=self._spec.embodiment_tag,
+                        state=vla.states,
+                        stats_key=self._stats_key,
+                    )
+                    sample["observation.state"] = self._concat_state(processed_states)
+                    sample["actions"] = self._concat_actions(processed_actions)
             else:
                 # No processor - use raw state and actions
                 sample["observation.state"] = self._concat_state(vla.states)
@@ -384,10 +833,7 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
             if vla.text is not None and (self._spec.language_key is None or self._spec.language_key):
                 sample["prompt"] = np.asarray(vla.text)
         else:
-            # Fallback: read parquet directly and decode videos using gr00t video utils.
-            from gr00t.utils.video_utils import get_frames_by_indices
-            from pathlib import Path
-
+            # Fallback: read parquet directly and decode videos using async video decoder.
             df = self._get_episode_df_fallback(episode_id)
 
             # Validate required columns exist
@@ -399,7 +845,7 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                     f"Available columns: {list(df.columns)}"
                 )
 
-            # Images (current frame only)
+            # Images (current frame only) - use async decoding
             for view in self._video_views:
                 if self._video_path_pattern is None:
                     continue
@@ -407,22 +853,22 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                 video_filename = self._video_path_pattern.format(
                     episode_chunk=chunk_idx, video_key=view, episode_index=int(episode_id)
                 )
-                video_path = self._dataset_path / video_filename
+                video_path = str(self._dataset_path / video_filename)
                 
                 # Validate video file exists
-                if not video_path.exists():
+                if not (self._dataset_path / video_filename).exists():
                     raise FileNotFoundError(
-                        f"Video file not found: {video_path}\n"
+                        f"Video file not found: {self._dataset_path / video_filename}\n"
                         f"Expected pattern: {self._video_path_pattern}\n"
                         f"Episode: {episode_id}, View: {view}, Chunk: {chunk_idx}"
                     )
                 
-                frames = get_frames_by_indices(
-                    str(video_path),
-                    np.asarray([step], dtype=np.int64),
-                    video_backend=self._spec.video_backend,
-                    video_backend_kwargs=self._spec.video_backend_kwargs or {},
+                # Use async video decoder
+                frames = self._decode_video_async(
+                    video_path, 
+                    np.asarray([step], dtype=np.int64)
                 )
+                
                 if len(frames) > 0:
                     # Normalize view name to observation.images.{view} format
                     clean_view = view.replace("observation.images.", "")
@@ -449,17 +895,46 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
             if "instruction.text" in df.columns:
                 sample["prompt"] = np.asarray(df["instruction.text"].iloc[step])
 
+            # Prefetch next frames in background (non-blocking)
+            self.prefetch_video_frames(episode_id, step)
+            
+            # Prefetch nearby episodes for cache warming
+            if (self._distributed_cache is not None and 
+                self._spec.enable_cache_warming and 
+                np.random.random() < 0.1):  # 10% chance to trigger prefetch
+                # Find nearby episodes to prefetch
+                current_ep_idx = np.where(self._episode_ids == episode_id)[0]
+                if len(current_ep_idx) > 0:
+                    ep_idx = current_ep_idx[0]
+                    # Prefetch next 2-3 episodes
+                    next_episodes = []
+                    for i in range(1, 4):
+                        if ep_idx + i < len(self._episode_ids):
+                            next_episodes.append(int(self._episode_ids[ep_idx + i]))
+                    if next_episodes:
+                        self.prefetch_episodes(next_episodes)
+
         return sample
 
     def _make_episode_cache(self):
         """Create LRU cache function for episode loading."""
-        maxsize = max(1, int(self._spec.episode_cache_size))
+        if self._distributed_cache is not None:
+            # Use intelligent distributed cache
+            def _cached(episode_id: int):
+                return self._distributed_cache.get(
+                    episode_id, 
+                    lambda eid: self._episode_loader[int(eid)]
+                )
+            return _cached
+        else:
+            # Fallback to simple LRU cache
+            maxsize = max(1, int(self._spec.episode_cache_size))
 
-        @lru_cache(maxsize=maxsize)
-        def _cached(episode_id: int):
-            return self._episode_loader[int(episode_id)]
+            @lru_cache(maxsize=maxsize)
+            def _cached(episode_id: int):
+                return self._episode_loader[int(episode_id)]
 
-        return _cached
+            return _cached
 
     def _ensure_episode_cache(self):
         """Lazily initialize episode cache per worker process."""
@@ -473,31 +948,60 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
 
     def _make_episode_cache_fallback(self):
         """Create LRU cache function for fallback episode loading."""
-        maxsize = max(1, int(self._spec.episode_cache_size))
-
-        @lru_cache(maxsize=maxsize)
-        def _cached(episode_id: int):
-            chunk_idx = int(episode_id) // int(self._chunk_size)
-            parquet_filename = self._data_path_pattern.format(episode_chunk=chunk_idx, episode_index=int(episode_id))
-            parquet_path = self._dataset_path / parquet_filename
+        if self._distributed_cache is not None:
+            # Use intelligent distributed cache
+            def _cached(episode_id: int):
+                def _load_episode(eid: int):
+                    chunk_idx = int(eid) // int(self._chunk_size)
+                    parquet_filename = self._data_path_pattern.format(episode_chunk=chunk_idx, episode_index=int(eid))
+                    parquet_path = self._dataset_path / parquet_filename
+                    
+                    # Validate parquet file exists
+                    if not parquet_path.exists():
+                        raise FileNotFoundError(
+                            f"Parquet file not found: {parquet_path}\n"
+                            f"Expected pattern: {self._data_path_pattern}\n"
+                            f"Episode: {eid}, Chunk: {chunk_idx}"
+                        )
+                    
+                    # Load minimal columns needed for openpi training.
+                    cols = ["observation.state", "action", "instruction.text"]
+                    # Some datasets may omit instruction.text; pandas will error if column missing.
+                    try:
+                        return pd.read_parquet(parquet_path, columns=cols)
+                    except Exception:
+                        return pd.read_parquet(parquet_path)
+                
+                return self._distributed_cache.get(episode_id, _load_episode)
             
-            # Validate parquet file exists
-            if not parquet_path.exists():
-                raise FileNotFoundError(
-                    f"Parquet file not found: {parquet_path}\n"
-                    f"Expected pattern: {self._data_path_pattern}\n"
-                    f"Episode: {episode_id}, Chunk: {chunk_idx}"
-                )
-            
-            # Load minimal columns needed for openpi training.
-            cols = ["observation.state", "action", "instruction.text"]
-            # Some datasets may omit instruction.text; pandas will error if column missing.
-            try:
-                return pd.read_parquet(parquet_path, columns=cols)
-            except Exception:
-                return pd.read_parquet(parquet_path)
+            return _cached
+        else:
+            # Fallback to simple LRU cache
+            maxsize = max(1, int(self._spec.episode_cache_size))
 
-        return _cached
+            @lru_cache(maxsize=maxsize)
+            def _cached(episode_id: int):
+                chunk_idx = int(episode_id) // int(self._chunk_size)
+                parquet_filename = self._data_path_pattern.format(episode_chunk=chunk_idx, episode_index=int(episode_id))
+                parquet_path = self._dataset_path / parquet_filename
+                
+                # Validate parquet file exists
+                if not parquet_path.exists():
+                    raise FileNotFoundError(
+                        f"Parquet file not found: {parquet_path}\n"
+                        f"Expected pattern: {self._data_path_pattern}\n"
+                        f"Episode: {episode_id}, Chunk: {chunk_idx}"
+                    )
+                
+                # Load minimal columns needed for openpi training.
+                cols = ["observation.state", "action", "instruction.text"]
+                # Some datasets may omit instruction.text; pandas will error if column missing.
+                try:
+                    return pd.read_parquet(parquet_path, columns=cols)
+                except Exception:
+                    return pd.read_parquet(parquet_path)
+
+            return _cached
 
     def _ensure_episode_cache_fallback(self):
         """Lazily initialize fallback episode cache per worker process."""

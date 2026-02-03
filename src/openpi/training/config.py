@@ -608,6 +608,39 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
+    # GPU utilization monitoring settings
+    enable_gpu_monitoring: bool = True
+    target_gpu_utilization: float = 0.85
+    gpu_monitoring_interval: float = 1.0
+    enable_bottleneck_detection: bool = True
+    enable_performance_suggestions: bool = True
+
+    # JAX compilation optimization settings
+    enable_jit_cache_warming: bool = True
+    jit_warmup_iterations: int = 3
+    jit_cache_persistence: bool = True
+    jit_max_cache_size: int = 100
+    log_compilation_timing: bool = True
+
+    # Memory optimization settings
+    enable_memory_optimization: bool = True
+    target_memory_utilization: float = 0.9
+    enable_auto_batch_sizing: bool = False  # Disabled by default for safety
+    min_batch_size: int = 1
+    max_batch_size: int = 512
+
+    # Training step optimization settings
+    enable_gradient_accumulation: bool = False
+    gradient_accumulation_steps: int = 1
+    enable_overlapped_computation: bool = True
+    enable_mixed_precision: bool = True
+    optimize_gradient_sync: bool = True
+
+    # Optimization configuration system
+    optimization_level: str = "balanced"  # "conservative", "balanced", "aggressive"
+    hardware_setup: str = "auto"  # "auto", "single_gpu", "multi_gpu", "cpu_only", "debug"
+    disable_all_optimizations: bool = False
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
