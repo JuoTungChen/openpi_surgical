@@ -20,7 +20,7 @@ class GPUMonitoringConfig:
     """Configuration for GPU utilization monitoring."""
     
     # Enable GPU utilization monitoring
-    enable_gpu_monitoring: bool = True
+    enable_gpu_monitoring: bool = False
     
     # Target GPU utilization threshold (0.0 to 1.0)
     target_gpu_utilization: float = 0.85
@@ -376,7 +376,7 @@ def create_optimization_config_from_train_config(train_config) -> OptimizationCo
     config = OptimizationConfig()
     
     # Extract GPU monitoring settings
-    config.gpu_monitoring.enable_gpu_monitoring = getattr(train_config, 'enable_gpu_monitoring', True)
+    config.gpu_monitoring.enable_gpu_monitoring = getattr(train_config, 'enable_gpu_monitoring', False)
     config.gpu_monitoring.target_gpu_utilization = getattr(train_config, 'target_gpu_utilization', 0.85)
     config.gpu_monitoring.monitoring_interval = getattr(train_config, 'gpu_monitoring_interval', 1.0)
     config.gpu_monitoring.enable_bottleneck_detection = getattr(train_config, 'enable_bottleneck_detection', True)
