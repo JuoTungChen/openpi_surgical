@@ -405,18 +405,20 @@ class JaxTrainingOptimizer:
         
         # Create JIT-compiled function with sharding but WITHOUT donation for warmup
         warmup_compiled_fn = jax.jit(
-            functools.partial(train_step_fn, train_config),
-            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            train_step_fn,
+            static_argnums=(0,),  # Mark config as static
+            in_shardings=(replicated_sharding, replicated_sharding, train_state_sharding, data_sharding),
             out_shardings=(train_state_sharding, replicated_sharding),
             # No donate_argnums for warmup to avoid consuming train_state
         )
         
         # Create the final compiled function WITH donation for actual training
         final_compiled_fn = jax.jit(
-            functools.partial(train_step_fn, train_config),
-            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            train_step_fn,
+            static_argnums=(0,),  # Mark config as static
+            in_shardings=(replicated_sharding, replicated_sharding, train_state_sharding, data_sharding),
             out_shardings=(train_state_sharding, replicated_sharding),
-            donate_argnums=(1,),
+            donate_argnums=(2,),  # Adjust donate_argnums since we're not using partial
         )
         
         # Warm up compilation cache if enabled
@@ -432,7 +434,7 @@ class JaxTrainingOptimizer:
                     warmup_rng = jax.random.split(rng)[0]
                     
                     # Use non-donating version for warmup
-                    _, _ = warmup_compiled_fn(warmup_rng, warmup_train_state, optimized_sample_batch)
+                    _, _ = warmup_compiled_fn(train_config, warmup_rng, warmup_train_state, optimized_sample_batch)
                     jax.block_until_ready(warmup_train_state)
                     
                 except Exception as e:
