@@ -924,6 +924,12 @@ _CONFIGS = [
                 "wrist_left",
                 "wrist_right",
             ],
+            enable_memory_optimization=True,
+            max_video_cache_size_mb=128,  # Reduced from default 256MB
+            video_frame_compression=True,  # Enable JPEG compression
+            video_frame_quality=85,  # Good balance of compression vs quality
+            lazy_video_loading=False,  # Keep False for now to avoid compatibility issues
+            reduce_video_resolution=False,  # Keep original resolution
             # Example repack: map your dataset's views to the openpi default image keys.
             # Update view names to match your dataset's "video" modality keys.
             base_config=DataConfig(
