@@ -207,6 +207,11 @@ def create_torch_dataset(
         # Note: action_horizon is implied by gr00t modality config delta_indices. We do a soft check here
         # to catch accidental mismatches between model config and embodiment config.
         # The dataset will still return whatever horizon the embodiment config defines.
+        
+        # Apply memory optimizations for large datasets or limited GPU memory
+        enable_memory_opt = getattr(data_config, 'gr00t_enable_memory_optimization', False)
+        max_cache_size = getattr(data_config, 'gr00t_max_video_cache_size_mb', 256)
+        
         spec = Gr00tDatasetSpec(
             dataset_path=data_config.gr00t_dataset_path,
             embodiment_tag=data_config.gr00t_embodiment_tag,
@@ -218,6 +223,16 @@ def create_torch_dataset(
             video_backend=data_config.gr00t_video_backend,
             apply_action_transforms=data_config.gr00t_apply_action_transforms,
             stats_key=data_config.gr00t_stats_key,
+            # Memory optimization settings
+            enable_memory_optimization=enable_memory_opt,
+            max_video_cache_size_mb=max_cache_size,
+            video_frame_compression=getattr(data_config, 'gr00t_video_frame_compression', False),
+            video_frame_quality=getattr(data_config, 'gr00t_video_frame_quality', 85),
+            lazy_video_loading=getattr(data_config, 'gr00t_lazy_video_loading', False),
+            reduce_video_resolution=getattr(data_config, 'gr00t_reduce_video_resolution', False),
+            target_video_resolution=getattr(data_config, 'gr00t_target_video_resolution', (224, 224)),
+            enable_frame_skipping=getattr(data_config, 'gr00t_enable_frame_skipping', False),
+            frame_skip_factor=getattr(data_config, 'gr00t_frame_skip_factor', 1),
         )
         dataset = Gr00tLeRobotTorchDataset(spec)
         return dataset

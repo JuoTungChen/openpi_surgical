@@ -116,6 +116,16 @@ class Gr00tDatasetSpec:
     enable_video_backend_optimization: bool = True
     video_backend_config: Optional[VideoBackendConfig] = None
     optimize_video_for_dataset: bool = True
+    # Memory optimization settings
+    enable_memory_optimization: bool = False
+    max_video_cache_size_mb: int = 256  # Reduced from 512MB default
+    video_frame_compression: bool = False  # Enable JPEG compression for cached frames
+    video_frame_quality: int = 85  # JPEG quality (0-100) when compression enabled
+    lazy_video_loading: bool = False  # Only decode videos when actually needed
+    reduce_video_resolution: bool = False  # Downsample videos to reduce memory
+    target_video_resolution: tuple[int, int] = (224, 224)  # Target resolution when downsampling
+    enable_frame_skipping: bool = False  # Skip frames to reduce temporal resolution
+    frame_skip_factor: int = 1  # Skip every N frames (1 = no skipping)
 
 
 class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
@@ -210,6 +220,10 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
         # Import here to avoid storing classes as instance variables
         from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
         from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
+        
+        # Apply memory optimizations if enabled
+        if spec.enable_memory_optimization:
+            self._apply_memory_optimizations()
         
         # Disable advanced optimizations to avoid pickle issues for now
         if spec.enable_intelligent_caching:
@@ -550,11 +564,18 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
 
     def _decode_video_async(self, video_path: str, frame_indices: np.ndarray) -> list[np.ndarray]:
         """Decode video frames using async decoder or video optimizer if available."""
+        # Apply frame skipping if enabled
+        if self._spec.enable_frame_skipping and self._spec.frame_skip_factor > 1:
+            # Skip frames to reduce memory usage
+            frame_indices = frame_indices[::self._spec.frame_skip_factor]
+        
         # Try video optimizer first (provides caching and optimization)
         video_optimizer = self._get_video_optimizer()
         if video_optimizer is not None:
             try:
-                return video_optimizer.decode_video_frames(video_path, frame_indices)
+                frames = video_optimizer.decode_video_frames(video_path, frame_indices)
+                # Apply memory optimizations to decoded frames
+                return self._apply_frame_optimizations(frames)
             except Exception as e:
                 warnings.warn(
                     f"Video optimizer failed: {e}. Falling back to async decoder.",
@@ -572,19 +593,39 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                 video_backend_kwargs=self._spec.video_backend_kwargs,
             )
             result = async_decoder.decode_sync(request)
-            return result.frames
+            # Apply memory optimizations to decoded frames
+            return self._apply_frame_optimizations(result.frames)
         else:
             # Final fallback to synchronous decoding
             try:
                 from gr00t.utils.video_utils import get_frames_by_indices
-                return get_frames_by_indices(
+                frames = get_frames_by_indices(
                     video_path,
                     frame_indices,
                     video_backend=self._spec.video_backend,
                     video_backend_kwargs=self._spec.video_backend_kwargs or {},
                 )
+                # Apply memory optimizations to decoded frames
+                return self._apply_frame_optimizations(frames)
             except ImportError:
                 return []
+
+    def _apply_frame_optimizations(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Apply memory optimization transformations to video frames."""
+        if not frames:
+            return frames
+        
+        optimized_frames = []
+        for frame in frames:
+            # Resize frame if needed
+            frame = self._resize_video_frame(frame)
+            
+            # Compress frame if needed
+            frame = self._compress_video_frame(frame)
+            
+            optimized_frames.append(frame)
+        
+        return optimized_frames
 
     def prefetch_video_frames(self, episode_id: int, step: int):
         """Prefetch video frames for future use (non-blocking)."""
@@ -744,6 +785,173 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
             )
         
         return False
+
+    def optimize_video_backend_for_dataset(self) -> bool:
+        """
+        Optimize video backend configuration based on dataset characteristics.
+        
+        Returns:
+            True if optimization was performed, False otherwise
+        """
+        if (not self._spec.optimize_video_for_dataset or 
+            not self._video_optimizer_config['enabled'] or
+            not self._video_views or 
+            self._video_path_pattern is None):
+            if self._video_path_pattern is None and self._video_views:
+                logging.warning("Video path pattern not available, skipping video backend optimization")
+            return False
+        
+        try:
+            # Collect sample video paths and frame counts
+            sample_videos = []
+            sample_frame_counts = []
+            
+            # Sample first few episodes
+            for i, episode_id in enumerate(self._episode_ids[:5]):
+                if i >= 3:  # Limit to 3 samples for performance
+                    break
+                
+                # Get video path for first view
+                view = self._video_views[0]
+                chunk_idx = int(episode_id) // int(self._chunk_size)
+                video_filename = self._video_path_pattern.format(
+                    episode_chunk=chunk_idx, video_key=view, episode_index=int(episode_id)
+                )
+                video_path = str(self._dataset_path / video_filename)
+                
+                if (self._dataset_path / video_filename).exists():
+                    sample_videos.append(video_path)
+                    # Use effective length as frame count estimate
+                    ep_idx = np.where(self._episode_ids == episode_id)[0][0]
+                    sample_frame_counts.append(int(self._effective_lengths[ep_idx]))
+            
+            if sample_videos:
+                # Get video optimizer and optimize configuration
+                video_optimizer = self._get_video_optimizer()
+                if video_optimizer is not None:
+                    optimized_config = video_optimizer.optimize_for_dataset(
+                        sample_videos, sample_frame_counts
+                    )
+                    
+                    # Update video optimizer with optimized config
+                    from openpi.training.video_backend_optimizer import shutdown_global_video_optimizer, get_global_video_optimizer
+                    shutdown_global_video_optimizer()
+                    self._video_optimizer = get_global_video_optimizer(optimized_config)
+                    
+                    return True
+                
+        except Exception as e:
+            warnings.warn(
+                f"Video backend optimization failed: {e}. Using default configuration.",
+                UserWarning,
+                stacklevel=2,
+            )
+        
+        return False
+
+    def _apply_memory_optimizations(self):
+        """Apply memory optimization settings to reduce GPU VRAM usage."""
+        spec = self._spec
+        
+        # Reduce video cache sizes
+        if hasattr(self, '_async_video_config'):
+            self._async_video_config['cache_size_mb'] = min(
+                self._async_video_config['cache_size_mb'], 
+                spec.max_video_cache_size_mb
+            )
+        
+        # Reduce video optimizer cache if enabled
+        if self._video_optimizer_config['enabled']:
+            if 'cache_size_mb' not in self._video_optimizer_config['extra_kwargs']:
+                self._video_optimizer_config['extra_kwargs']['cache_size_mb'] = spec.max_video_cache_size_mb
+            else:
+                self._video_optimizer_config['extra_kwargs']['cache_size_mb'] = min(
+                    self._video_optimizer_config['extra_kwargs']['cache_size_mb'],
+                    spec.max_video_cache_size_mb
+                )
+        
+        # Configure video backend for memory efficiency
+        if spec.video_backend_kwargs is None:
+            spec.video_backend_kwargs = {}
+        
+        # Add memory-efficient video decoding settings
+        video_kwargs = spec.video_backend_kwargs.copy()
+        
+        if spec.video_backend == "torchcodec":
+            # Reduce thread count to save memory
+            video_kwargs.setdefault('num_threads', min(2, mp.cpu_count() // 2))
+            # Use memory-efficient pixel format
+            video_kwargs.setdefault('pixel_format', 'rgb24')
+            # Disable hardware acceleration if it causes memory issues
+            if spec.reduce_video_resolution:
+                video_kwargs['hardware_acceleration'] = False
+        
+        # Update video backend kwargs
+        object.__setattr__(spec, 'video_backend_kwargs', video_kwargs)
+        
+        logging.info(f"Applied memory optimizations: max_cache={spec.max_video_cache_size_mb}MB, "
+                    f"compression={spec.video_frame_compression}, "
+                    f"lazy_loading={spec.lazy_video_loading}")
+
+    def _compress_video_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Compress video frame using JPEG compression to save memory."""
+        if not self._spec.video_frame_compression:
+            return frame
+        
+        try:
+            import cv2
+            
+            # Convert to uint8 if needed
+            if frame.dtype != np.uint8:
+                if frame.max() <= 1.0:
+                    frame = (frame * 255).astype(np.uint8)
+                else:
+                    frame = frame.astype(np.uint8)
+            
+            # Compress using JPEG
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self._spec.video_frame_quality]
+            _, encoded_img = cv2.imencode('.jpg', frame, encode_param)
+            
+            # Decompress back to numpy array
+            compressed_frame = cv2.imdecode(encoded_img, cv2.IMREAD_COLOR)
+            
+            # Convert BGR back to RGB if needed
+            if compressed_frame.shape[-1] == 3:
+                compressed_frame = cv2.cvtColor(compressed_frame, cv2.COLOR_BGR2RGB)
+            
+            return compressed_frame
+            
+        except ImportError:
+            warnings.warn("OpenCV not available for frame compression, using original frame", UserWarning)
+            return frame
+        except Exception as e:
+            warnings.warn(f"Frame compression failed: {e}, using original frame", UserWarning)
+            return frame
+
+    def _resize_video_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Resize video frame to reduce memory usage."""
+        if not self._spec.reduce_video_resolution:
+            return frame
+        
+        try:
+            import cv2
+            
+            target_h, target_w = self._spec.target_video_resolution
+            current_h, current_w = frame.shape[:2]
+            
+            # Only resize if current resolution is larger
+            if current_h > target_h or current_w > target_w:
+                resized_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                return resized_frame
+            
+            return frame
+            
+        except ImportError:
+            warnings.warn("OpenCV not available for frame resizing, using original frame", UserWarning)
+            return frame
+        except Exception as e:
+            warnings.warn(f"Frame resizing failed: {e}, using original frame", UserWarning)
+            return frame
 
     def get_action_processing_stats(self) -> dict[str, Any]:
         """Get action processing performance statistics."""
