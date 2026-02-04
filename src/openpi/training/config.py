@@ -928,7 +928,7 @@ _CONFIGS = [
             max_video_cache_size_mb=128,  # Reduced from default 256MB
             video_frame_compression=True,  # Enable JPEG compression
             video_frame_quality=85,  # Good balance of compression vs quality
-            lazy_video_loading=False,  # Keep False for now to avoid compatibility issues
+            lazy_video_loading=True,  # ENABLED - videos decoded on-demand, reduces cache memory by ~10x
             reduce_video_resolution=False,  # Keep original resolution
             # Example repack: map your dataset's views to the openpi default image keys.
             # Update view names to match your dataset's "video" modality keys.
@@ -986,7 +986,7 @@ _CONFIGS = [
             max_video_cache_size_mb=128,  # Reduced from default 256MB
             video_frame_compression=True,  # Enable JPEG compression
             video_frame_quality=85,  # Good balance of compression vs quality
-            lazy_video_loading=False,  # Keep False for now to avoid compatibility issues
+            lazy_video_loading=True,  # ENABLED - videos decoded on-demand, reduces cache memory by ~10x
             reduce_video_resolution=False,  # Keep original resolution
             # Example repack: map your dataset's views to the openpi default image keys.
             # Update view names to match your dataset's "video" modality keys.

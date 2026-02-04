@@ -356,12 +356,14 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                         stacklevel=2,
                     )
 
+            # Enable lazy video loading if requested - skip video loading during episode caching
+            # Videos will be loaded on-demand in __getitem__
             self._episode_loader = LeRobotEpisodeLoader(
                 dataset_path=spec.dataset_path,
                 modality_configs=self._modality_configs,
                 video_backend=spec.video_backend,
                 video_backend_kwargs=spec.video_backend_kwargs,
-                skip_video=False,
+                skip_video=spec.lazy_video_loading,  # Skip video loading if lazy loading enabled
                 require_stats=False,
             )
 
@@ -384,8 +386,13 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
             else:
                 self._video_views = spec.video_views or []
 
+            # Initialize dataset path and chunk size for video loading
+            # This is needed for lazy video loading and video backend optimization
+            from pathlib import Path
+            self._dataset_path = Path(spec.dataset_path)
+            self._chunk_size = 1000  # Default chunk size
+            
             # Initialize video path pattern for gr00t modality config path
-            # This is needed for video backend optimization
             self._video_path_pattern = None
             if self._video_views:
                 # For gr00t datasets, try to infer video path pattern from dataset structure
@@ -395,8 +402,7 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                 # Try to read from info.json if available
                 try:
                     import json
-                    from pathlib import Path
-                    info_path = Path(spec.dataset_path) / "meta" / "info.json"
+                    info_path = self._dataset_path / "meta" / "info.json"
                     if info_path.exists():
                         info_meta = json.loads(info_path.read_text())
                         if "video_path" in info_meta:
@@ -404,18 +410,10 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
                         # Also get chunk size if available
                         if "chunks_size" in info_meta:
                             self._chunk_size = int(info_meta["chunks_size"])
-                        else:
-                            self._chunk_size = 1000  # Default chunk size
-                    else:
-                        self._chunk_size = 1000  # Default chunk size
-                        
-                    # Also need dataset path for video optimization
-                    self._dataset_path = Path(spec.dataset_path)
                         
                 except Exception:
                     # If we can't read info.json, use defaults
-                    self._chunk_size = 1000
-                    self._dataset_path = Path(spec.dataset_path)
+                    pass
 
             self._state_keys = list(self._modality_configs["state"].modality_keys)
             self._action_keys = list(self._modality_configs["action"].modality_keys)
@@ -561,6 +559,66 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
             img = np.asarray(frames[0])
             out[view] = img
         return out
+
+    def _load_video_frames_lazy(self, episode_id: int, step: int) -> dict[str, np.ndarray]:
+        """
+        Load video frames on-demand for a specific episode and step.
+        Used when lazy_video_loading is enabled.
+        
+        Args:
+            episode_id: Episode ID to load from
+            step: Step index within the episode
+            
+        Returns:
+            Dictionary mapping view names to decoded frames
+        """
+        images = {}
+        
+        if not self._video_views or self._video_path_pattern is None:
+            return images
+        
+        try:
+            # Get video delta indices from modality config
+            video_deltas = list(self._modality_configs["video"].delta_indices)
+            
+            for view in self._video_views:
+                # Construct video path
+                chunk_idx = int(episode_id) // int(self._chunk_size)
+                video_filename = self._video_path_pattern.format(
+                    episode_chunk=chunk_idx, 
+                    video_key=view, 
+                    episode_index=int(episode_id)
+                )
+                video_path = str(self._dataset_path / video_filename)
+                
+                # Check if video exists
+                if not (self._dataset_path / video_filename).exists():
+                    warnings.warn(
+                        f"Video file not found: {video_filename}. Skipping view {view}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    continue
+                
+                # Get frame indices to load (current step + deltas)
+                frame_indices = np.array([step + delta for delta in video_deltas], dtype=np.int64)
+                
+                # Decode frames
+                frames = self._decode_video_async(video_path, frame_indices)
+                
+                if len(frames) > 0:
+                    # Take the first frame (current timestep, delta=0)
+                    # This matches the behavior of _select_images
+                    images[view] = np.asarray(frames[0])
+                    
+        except Exception as e:
+            warnings.warn(
+                f"Failed to load video frames for episode {episode_id}, step {step}: {e}",
+                UserWarning,
+                stacklevel=2,
+            )
+        
+        return images
 
     def _decode_video_async(self, video_path: str, frame_indices: np.ndarray) -> list[np.ndarray]:
         """Decode video frames using async decoder or video optimizer if available."""
@@ -977,7 +1035,13 @@ class Gr00tLeRobotTorchDataset(torch.utils.data.Dataset):
 
             # Images -> LeRobot-style flat keys.
             # Normalize all image keys to observation.images.{view} format
-            images = self._select_images(vla.images)
+            if self._spec.lazy_video_loading:
+                # Lazy loading: decode videos on-demand instead of from cached episode
+                images = self._load_video_frames_lazy(episode_id, step)
+            else:
+                # Eager loading: use pre-decoded videos from episode cache
+                images = self._select_images(vla.images)
+            
             for view_name, img in images.items():
                 # Strip prefix if present, then add it back consistently
                 clean_view = view_name.replace("observation.images.", "")
