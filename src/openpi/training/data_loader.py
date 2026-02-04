@@ -209,8 +209,8 @@ def create_torch_dataset(
         # The dataset will still return whatever horizon the embodiment config defines.
         
         # Apply memory optimizations for large datasets or limited GPU memory
-        enable_memory_opt = getattr(data_config, 'gr00t_enable_memory_optimization', False)
-        max_cache_size = getattr(data_config, 'gr00t_max_video_cache_size_mb', 256)
+        enable_memory_opt = data_config.gr00t_enable_memory_optimization
+        max_cache_size = data_config.gr00t_max_video_cache_size_mb
         
         spec = Gr00tDatasetSpec(
             dataset_path=data_config.gr00t_dataset_path,
@@ -226,13 +226,13 @@ def create_torch_dataset(
             # Memory optimization settings
             enable_memory_optimization=enable_memory_opt,
             max_video_cache_size_mb=max_cache_size,
-            video_frame_compression=getattr(data_config, 'gr00t_video_frame_compression', False),
-            video_frame_quality=getattr(data_config, 'gr00t_video_frame_quality', 85),
-            lazy_video_loading=getattr(data_config, 'gr00t_lazy_video_loading', False),
-            reduce_video_resolution=getattr(data_config, 'gr00t_reduce_video_resolution', False),
-            target_video_resolution=getattr(data_config, 'gr00t_target_video_resolution', (224, 224)),
-            enable_frame_skipping=getattr(data_config, 'gr00t_enable_frame_skipping', False),
-            frame_skip_factor=getattr(data_config, 'gr00t_frame_skip_factor', 1),
+            video_frame_compression=data_config.gr00t_video_frame_compression,
+            video_frame_quality=data_config.gr00t_video_frame_quality,
+            lazy_video_loading=data_config.gr00t_lazy_video_loading,
+            reduce_video_resolution=data_config.gr00t_reduce_video_resolution,
+            target_video_resolution=data_config.gr00t_target_video_resolution,
+            enable_frame_skipping=data_config.gr00t_enable_frame_skipping,
+            frame_skip_factor=data_config.gr00t_frame_skip_factor,
         )
         dataset = Gr00tLeRobotTorchDataset(spec)
         return dataset

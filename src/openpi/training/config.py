@@ -118,6 +118,17 @@ class DataConfig:
     gr00t_apply_action_transforms: bool = True
     # Statistics key for normalization (if None, will be inferred from embodiment_tag).
     gr00t_stats_key: str | None = None
+    
+    # Memory optimization settings for GR00T dataset
+    gr00t_enable_memory_optimization: bool = False
+    gr00t_max_video_cache_size_mb: int = 256
+    gr00t_video_frame_compression: bool = False
+    gr00t_video_frame_quality: int = 85
+    gr00t_lazy_video_loading: bool = False
+    gr00t_reduce_video_resolution: bool = False
+    gr00t_target_video_resolution: tuple[int, int] = (224, 224)
+    gr00t_enable_frame_skipping: bool = False
+    gr00t_frame_skip_factor: int = 1
 
 
 class GroupFactory(Protocol):
@@ -502,6 +513,17 @@ class Gr00tLocalLeRobotDataConfig(DataConfigFactory):
     video_backend: str = "torchcodec"
     apply_action_transforms: bool = True  # Apply GR00T action representation transforms
     stats_key: str | None = None  # Statistics key for normalization
+    
+    # Memory optimization settings
+    enable_memory_optimization: bool = False
+    max_video_cache_size_mb: int = 256
+    video_frame_compression: bool = False
+    video_frame_quality: int = 85
+    lazy_video_loading: bool = False
+    reduce_video_resolution: bool = False
+    target_video_resolution: tuple[int, int] = (224, 224)
+    enable_frame_skipping: bool = False
+    frame_skip_factor: int = 1
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -539,6 +561,16 @@ class Gr00tLocalLeRobotDataConfig(DataConfigFactory):
             gr00t_video_backend=self.video_backend,
             gr00t_apply_action_transforms=self.apply_action_transforms,
             gr00t_stats_key=self.stats_key,
+            # Memory optimization settings
+            gr00t_enable_memory_optimization=self.enable_memory_optimization,
+            gr00t_max_video_cache_size_mb=self.max_video_cache_size_mb,
+            gr00t_video_frame_compression=self.video_frame_compression,
+            gr00t_video_frame_quality=self.video_frame_quality,
+            gr00t_lazy_video_loading=self.lazy_video_loading,
+            gr00t_reduce_video_resolution=self.reduce_video_resolution,
+            gr00t_target_video_resolution=self.target_video_resolution,
+            gr00t_enable_frame_skipping=self.enable_frame_skipping,
+            gr00t_frame_skip_factor=self.frame_skip_factor,
         )
 
 
