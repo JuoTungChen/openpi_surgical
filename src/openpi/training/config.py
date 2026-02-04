@@ -953,6 +953,64 @@ _CONFIGS = [
         num_workers=8,  # More workers for parallel data loading (adjust based on CPU cores)
     ),
     #
+    # Memory-optimized version of pi05_gr00t_local with video compression enabled
+    #
+    TrainConfig(
+        name="pi05_gr00t_local_memory_optimized",
+        model=pi0.Pi0Config(pi05=True),
+        data=Gr00tLocalLeRobotDataConfig(
+            # Used for checkpoint metadata + default asset_id. Doesn't need to exist on HF.
+            repo_id="local/gr00t_lerobot_memory_optimized",
+            # Local LeRobot dataset root (contains meta/ and data/).
+            dataset_path="/home/iulian/chole_ws/data/open_h_suturing",
+            # Must match a key in `gr00t.configs.data.embodiment_configs.MODALITY_CONFIGS`
+            embodiment_tag="dvrk",
+            # Path to GR00T modality config file (required for embodiment registration)
+            modality_config_path="/home/iulian/chole_ws/src/gr00t_n1.6/examples/dVRK/dVRK_config.py",
+            # Optional: choose what text to map into "prompt" (depends on dataset + gr00t config).
+            language_key=None,
+            # Optional: restrict to a specific set/order of video views.
+            video_views=[
+                "endoscope_left",
+                "wrist_left",
+                "wrist_right",
+            ],
+            # Memory optimization settings - ENABLED
+            enable_memory_optimization=True,
+            max_video_cache_size_mb=128,  # Reduced from default 256MB
+            video_frame_compression=True,  # Enable JPEG compression
+            video_frame_quality=85,  # Good balance of compression vs quality
+            lazy_video_loading=False,  # Keep False for now to avoid compatibility issues
+            reduce_video_resolution=False,  # Keep original resolution
+            # Example repack: map your dataset's views to the openpi default image keys.
+            # Update view names to match your dataset's "video" modality keys.
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "image": {
+                                    # Use left endoscope as the base view (required by pi0/pi0.5).
+                                    "base_0_rgb": "observation.images.endoscope_left",
+                                    "left_wrist_0_rgb": "observation.images.wrist_left",
+                                    "right_wrist_0_rgb": "observation.images.wrist_right",
+                                },
+                                "state": "observation.state",
+                                "actions": "actions",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+            ),
+        ),
+        # You likely want to load a pi0.5 base checkpoint. Replace path as needed.
+        # weight_loader=weight_loaders.CheckpointWeightLoader("<path_or_gs_uri_to_pi05_base_params>"),
+        num_train_steps=30_000,
+        # Reduced workers for memory efficiency
+        num_workers=4,  # Reduced from 8 to save memory
+    ),
+    #
     # Fine-tuning Aloha configs.
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
