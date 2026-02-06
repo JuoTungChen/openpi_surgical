@@ -4,7 +4,6 @@ import json
 import logging
 import pathlib
 import platform
-import time
 from typing import Any
 
 import etils.epath as epath
@@ -63,7 +62,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="auto", project=config.project_name)
     else:
         wandb.init(
             name=config.exp_name,
@@ -356,14 +355,12 @@ def maybe_save_gr00t_statistics(checkpoint_dir: pathlib.Path, data_loader: _data
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
-
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
-
     # Create optimization configurations with graceful fallback
     performance_config, jax_optimization_config, multi_gpu_config = create_optimization_configs(config)
 
@@ -414,7 +411,6 @@ def main(config: _config.TrainConfig):
     # Mark data loading start for performance monitoring
     if performance_integrator:
         performance_integrator.on_data_loading_start()
-
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
@@ -422,17 +418,12 @@ def main(config: _config.TrainConfig):
     )
     maybe_save_gr00t_statistics(config.checkpoint_dir, data_loader)
     data_iter = iter(data_loader)
-    data_fetch_times: list[float] = []
-    compute_times: list[float] = []
-    fetch_start = time.perf_counter()
     batch = next(data_iter)
-    data_fetch_times.append(time.perf_counter() - fetch_start)
 
     # Mark data loading end
     if performance_integrator:
         performance_integrator.on_data_loading_end()
 
-    logging.info("Initial batch fetch time: %.3fs", data_fetch_times[-1])
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
@@ -496,7 +487,6 @@ def main(config: _config.TrainConfig):
             donate_argnums=(1,),
         )
         logging.info("Using standard training step (no optimizations)")
-
     try:
         start_step = int(train_state.step)
     except RuntimeError as e:
@@ -544,9 +534,7 @@ def main(config: _config.TrainConfig):
             # Mark data loading start
             if performance_integrator:
                 performance_integrator.on_data_loading_start()
-            fetch_start = time.perf_counter()
             batch = next(data_iter)
-            data_fetch_times.append(time.perf_counter() - fetch_start)
 
             # Optimize data transfer for better memory efficiency (with fallback)
             if jax_optimizer:
@@ -561,8 +549,6 @@ def main(config: _config.TrainConfig):
             # Mark computation start
             if performance_integrator:
                 performance_integrator.on_computation_start()
-            compute_start = time.perf_counter()
-
             with sharding.set_mesh(mesh):
                 # Use appropriate signature based on whether we're using optimized step
                 # Optimized step has config baked in: (rng, train_state, batch)
@@ -571,10 +557,6 @@ def main(config: _config.TrainConfig):
                     train_state, info = ptrain_step(train_rng, train_state, batch)
                 else:
                     train_state, info = ptrain_step(config, train_rng, train_state, batch)
-            # JAX executes asynchronously; block to measure actual compute time.
-            jax.block_until_ready(info["loss"])
-            compute_times.append(time.perf_counter() - compute_start)
-
             # Mark computation end
             if performance_integrator:
                 performance_integrator.on_computation_end()
@@ -586,15 +568,10 @@ def main(config: _config.TrainConfig):
                 stacked_infos = common_utils.stack_forest(infos)
                 reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
                 info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-                avg_fetch_ms = (sum(data_fetch_times) / len(data_fetch_times)) * 1000 if data_fetch_times else 0.0
-                avg_compute_ms = (sum(compute_times) / len(compute_times)) * 1000 if compute_times else 0.0
-                info_str = f"{info_str} | data_fetch_ms={avg_fetch_ms:.1f} | compute_ms={avg_compute_ms:.1f}"
                 pbar.write(f"Step {step}: {info_str}")
                 if config.wandb_enabled:
                     wandb.log(reduced_info, step=step)
                 infos = []
-                data_fetch_times = []
-                compute_times = []
 
             # Performance monitoring step end
             if performance_integrator:

@@ -519,8 +519,6 @@ class TorchDataLoader:
             prefetch_factor = _get_optimal_prefetch_factor(num_workers)
             # Disable memory pinning in containerized environments to avoid hangs
             pin_memory = False  # Changed from True to fix container hangs
-            # Disable persistent workers to avoid process management issues in containers
-            persistent_workers = False  # Changed from True to fix container hangs
 
         generator = torch.Generator()
         generator.manual_seed(seed)
