@@ -188,7 +188,10 @@ class LowLevelPolicy:
         self.user_correction_start_t = None
         self.use_preprogrammed_correction = False
         self.rot_6d = False
-        self.get_img_from_dataset = True
+        self.get_img_from_dataset = False
+        self.show_count = 98
+        self.sketch_points = None
+        
         # self.rot_6d = args.use_6d
         # self.no_states = args.no_states
         self.no_states = True
@@ -196,12 +199,13 @@ class LowLevelPolicy:
         # self.stereo = args.use_stereo
         self.stereo = False
         self.skip_every = 1
+        self.goal_condition_style = args.style
         # self.skip_every = args.skip_every
         # self.stereo = False
 
 
     def initialize_ros(self):
-        self.language_instruction = None
+        self.language_instruction = "needle pickup"
         self.rt = ros_topics()
         self.ral = crtk.ral('dvrk_arm_test')
         self.bridge = CvBridge()
@@ -210,12 +214,23 @@ class LowLevelPolicy:
         self.instruction_sub = rospy.Subscriber("/instructor_prediction", String, self.language_instruction_callback, queue_size=10)
         self.pause_sub = rospy.Subscriber("/pause_robot", Bool, self.pause_robot_callback, queue_size=10)
         self.action_horizon_sub = rospy.Subscriber("/action_horizon", Int16, self.action_horizon_callback, queue_size=10)
+        rospy.Subscriber('/sketch_points', Float32MultiArray, self.sketch_point_callback, queue_size=1)
         
         #     ## --------------------- callbacks -----------------------
     def language_instruction_callback(self, msg):
         print("instruction:", msg.data)
         self.language_instruction = msg.data
-    
+        
+    def sketch_point_callback(self, msg):
+        self.sketch_points = np.array(msg.data).reshape(-1, 2)
+        #print("sketch points received: ", self.sketch_points)
+        if self.sketch_points.shape[0] > 0:
+            self.use_sketch = True
+            #print("use sketch: ", self.use_sketch)
+        else:
+            self.use_sketch = False
+            #print("use sketch: ", self.use_sketch)
+
     def pause_robot_callback(self, msg):
         self.pause = msg.data
         
@@ -275,7 +290,7 @@ class LowLevelPolicy:
                 # print(action.shape)
                 # input("Press Enter to continue...")
                 action = np.stack(action)  # or np.array(arr_list)
-                print(action)
+                # print(action)
                 # input("Press Enter to continue...")
                 
                 # action = self.unnormalize_action(action, self.task_config['norm_scheme'])
@@ -304,8 +319,8 @@ class LowLevelPolicy:
                     actions_psm2[:, 7] = np.clip(action[:, 19], -0.698, 0.698)  # copy over gripper angles  
                 else:
                     action_normalized = deepcopy(action)
-                    # action_normalized[:, 0:3] -= action[0, 0:3]
-                    # action_normalized[:, 7:10] -= action[0, 7:10]
+                    action_normalized[:, 0:3] -= action[0, 0:3]
+                    action_normalized[:, 7:10] -= action[0, 7:10]
                     actions_psm1[:, 0:3] = qpos_psm1[0:3] + action_normalized[:, 0:3] # convert to current translation
                     actions_psm1 = self.convert_delta_rotvec_to_taskspace_quat(action[:, 0:7], actions_psm1, qpos_psm1)
                     actions_psm1[:, 7] = np.clip(action[:, 6], -0.698, 0.698)  # copy over gripper angles
@@ -313,13 +328,13 @@ class LowLevelPolicy:
                     actions_psm2 = self.convert_delta_rotvec_to_taskspace_quat(action[:, 7:], actions_psm2, qpos_psm2)
                     actions_psm2[:, 7] = np.clip(action[:, 13], -0.698, 0.698)  # copy over gripper angles  
                         
-                print("actions_psm1: ", actions_psm1, "\nactions_psm2: ", actions_psm2)
+                # print("actions_psm1: ", actions_psm1, "\nactions_psm2: ", actions_psm2)
                 # Send actions to the robot (assume methods are implemented)
                 # self.plot_actions_psm2( qpos_psm2, actions_psm2)
 
-                self.plot_actions_comparison(actions_psm2, self.action_psm2_gt)
+                # self.plot_actions_comparison(actions_psm2, self.action_psm2_gt)
                 # if not self.is_correction:
-                # self.execute_actions(actions_psm1, actions_psm2)
+                self.execute_actions(actions_psm1, actions_psm2)
                 
                 t += 1
                 
@@ -367,7 +382,70 @@ class LowLevelPolicy:
         
         return all_actions_converted
 
+    def create_offset_map_with_gradient(self, image_shape, insert_point, exit_point, normalize_size=224.0, device='cpu', eps=1e-6):
+        """
+        Returns a 3-channel offset map:
+        - Channel 0: dx to insertion point
+        - Channel 1: dy to insertion point
+        - Channel 2: scalar heatmap (1 at insertion, 0 at exit)
 
+        Args:
+            image_shape: (H, W)
+            insert_point: (x, y)
+            exit_point: (x, y)
+            normalize_size: reference image size for normalization
+            device: 'cpu' or 'cuda'
+        """
+        H, W = image_shape
+        normalizing_constant = 250.0 * (min(H, W) / normalize_size)
+
+        y_coords = torch.arange(H, device=device)
+        x_coords = torch.arange(W, device=device)
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+
+        # Offsets to insertion point (dy, dx)
+        dx = (x_grid - insert_point[0]) / normalizing_constant
+        dy = (y_grid - insert_point[1]) / normalizing_constant
+
+        # Gradient heatmap: insertion → 1.0, exit → 0.0
+        d_insert = torch.sqrt((x_grid - insert_point[0]) ** 2 + (y_grid - insert_point[1]) ** 2)
+        d_exit = torch.sqrt((x_grid - exit_point[0]) ** 2 + (y_grid - exit_point[1]) ** 2)
+        heat = d_exit / (d_insert + d_exit + eps)  # in [0, 1]
+
+        # Stack to shape (3, H, W)
+        offset_map = torch.stack([dx, dy, heat], dim=0)
+        return offset_map.clamp(-1.0, 1.0)  # Optional clamp
+
+
+    def offset_map_to_rgb_visual(self, offset_map):
+        """
+        Converts a (3, H, W) offset map (dx, dy, heat) to a uint8 RGB image for visualization.
+        - Red = dx
+        - Green = dy
+        - Blue = heat
+        """
+        if torch.is_tensor(offset_map):
+            offset_map = offset_map.detach().cpu().numpy()
+
+        # Normalize each channel to [0, 1]
+        def normalize(x):
+            x = x - np.min(x)
+            x = x / (np.max(x) + 1e-6)
+            return x
+
+        dx_norm = normalize(offset_map[0])
+        dy_norm = normalize(offset_map[1])
+        heat_norm = normalize(offset_map[2])
+
+        rgb_image = np.stack([
+            dx_norm,     # R
+            dy_norm,     # G
+            heat_norm    # B
+        ], axis=-1)  # (H, W, 3)
+
+        rgb_uint8 = (rgb_image * 255).astype(np.uint8)
+        return rgb_uint8
+    
     def get_observation_dvrk(self) -> dict:
         if self.get_img_from_dataset:
             dataset_path = "/home/grapes/Desktop/needle_pickup_1"
@@ -390,12 +468,70 @@ class LowLevelPolicy:
             lw_img = self.rt.endo_cam_psm2
             rw_img = self.rt.endo_cam_psm1
 
+
+        self.left_img = cv2.resize(self.left_img, (960, 540))
+
+        if self.goal_condition_style == "dot":
+            if  self.language_instruction == "needle throw" and self.sketch_points is not None and self.sketch_points.shape[0] == 2:
+
+                h, w = self.left_img.shape[:2]
+                clicked_points_mask = np.zeros((h, w, 3), dtype=np.uint8)
+                # Draw insertion point (first point) as red
+                insert_x, insert_y = int(self.sketch_points[0][0]), int(self.sketch_points[0][1])
+                cv2.circle(clicked_points_mask, (insert_x, insert_y), radius=10, color=(255, 0, 0), thickness=-1)  # Red in BGR
+
+                # Draw exit point (second point) as green
+                exit_x, exit_y = int(self.sketch_points[1][0]), int(self.sketch_points[1][1])
+                cv2.circle(clicked_points_mask, (exit_x, exit_y), radius=10, color=(0, 255, 0), thickness=-1)  # Green in BGR
+                # Only blend where the mask has non-zero content
+                nonzero_mask = np.any(clicked_points_mask != 0, axis=-1)
+                overlay = self.left_img.copy()
+                overlay[nonzero_mask] = cv2.addWeighted(
+                    self.left_img, 0.5, clicked_points_mask, 0.5, 0
+                )[nonzero_mask]
+                self.left_img = overlay
+
+        elif self.goal_condition_style == "mask":
+
+            if  self.language_instruction == "needle throw" and self.sketch_points is not None and self.sketch_points.shape[0] == 2:
+                # Create a 3-channel mask (H, W, 3) with all zeros
+                h, w = self.left_img.shape[:2]
+                clicked_points_mask = np.zeros((h, w, 3), dtype=np.uint8)
+                # Draw insertion point (first point) as red
+                insert_x, insert_y = int(self.sketch_points[0][0]), int(self.sketch_points[0][1])
+                cv2.circle(clicked_points_mask, (insert_x, insert_y), radius=10, color=(255, 0, 0), thickness=-1)  # Red in BGR
+
+                # Draw exit point (second point) as green
+                exit_x, exit_y = int(self.sketch_points[1][0]), int(self.sketch_points[1][1])
+                cv2.circle(clicked_points_mask, (exit_x, exit_y), radius=10, color=(0, 255, 0), thickness=-1)  # Green in BGR
+                mask_img = clicked_points_mask
+                    
+            else:
+                mask_img = np.zeros_like(self.left_img)
+
+        elif self.goal_condition_style == "map":
+
+            if  self.language_instruction == "needle throw" and self.sketch_points is not None and self.sketch_points.shape[0] == 2:
+                print("sketch points: ", self.sketch_points)
+                h, w = self.left_img.shape[:2]
+                insert_x, insert_y = int(self.sketch_points[0][0]), int(self.sketch_points[0][1])
+                exit_x, exit_y = int(self.sketch_points[1][0]), int(self.sketch_points[1][1])
+
+                # Create offset map
+                offset_map = self.create_offset_map_with_gradient(
+                    image_shape=(h, w),
+                    insert_point=(insert_x, insert_y),
+                    exit_point=(exit_x, exit_y),
+                    device='cpu'
+                )
+
+                mask_img = self.offset_map_to_rgb_visual(offset_map)
+
+            else:
+                mask_img = np.zeros_like(self.left_img)
+
         self.left_img = cv2.cvtColor(self.left_img, cv2.COLOR_BGR2RGB)
         self.left_img = resize_with_padding(self.left_img, 224, 224).astype(np.uint8)
-
-        plt.imshow(self.left_img)
-        plt.show()
-
         
         lw_img = cv2.cvtColor(lw_img, cv2.COLOR_BGR2RGB)
         lw_img = resize_with_padding(lw_img, 224, 224).astype(np.uint8)
@@ -404,13 +540,45 @@ class LowLevelPolicy:
         rw_img = cv2.cvtColor(rw_img, cv2.COLOR_BGR2RGB)
         rw_img = resize_with_padding(rw_img, 224, 224).astype(np.uint8)
         
+        if self.goal_condition_style == "mask" or self.goal_condition_style == "map":
+            mask_img = cv2.cvtColor(mask_img, cv2.COLOR_BGR2RGB)
+            mask_img = resize_with_padding(mask_img, 224, 224).astype(np.uint8)
         
-        observation = {
-            "full_image": self.left_img.tolist(),
-            "left_wrist_image": lw_img.tolist(),
-            "right_wrist_image": rw_img.tolist(),
-            "instruction": "needle pickup"  if self.language_instruction is None else self.language_instruction,
-        }
+        
+        if self.show_count % 100 == 0:
+            num_cam = 4 if (self.goal_condition_style == "mask" or self.goal_condition_style == "map") else 3 
+            figure, ax = plt.subplots(1, num_cam, figsize=(20, 5))
+            ax[0].imshow(self.left_img)
+            ax[0].set_title("Left Image")
+            ax[1].imshow(lw_img)
+            ax[1].set_title("Left PSM Image")
+            ax[2].imshow(rw_img)
+            ax[2].set_title("Right PSM Image")
+            if self.goal_condition_style == "mask" or self.goal_condition_style == "map":
+                ax[3].imshow(mask_img)
+                ax[3].set_title("Mask Image")
+            plt.show()
+
+            
+        self.show_count += 1
+        if self.goal_condition_style == "mask" or self.goal_condition_style == "map":
+        
+            observation = {
+                "full_image": self.left_img.tolist(),
+                "left_wrist_image": lw_img.tolist(),
+                "right_wrist_image": rw_img.tolist(),
+                "wrist_mask": mask_img.tolist(),
+                "instruction": str(self.language_instruction)
+            }
+        else:
+            observation = {
+                "full_image": self.left_img.tolist(),
+                "left_wrist_image": lw_img.tolist(),
+                "right_wrist_image": rw_img.tolist(),
+                "instruction": str(self.language_instruction)
+            }
+        # obs = {"observation": observation, "instruction": instruction}
+        # print("using instruction:", obs["instruction"])
         return observation
         
 
@@ -485,6 +653,7 @@ if __name__ == "__main__":
     parser.add_argument("--server_url", type=str, default="10.162.34.202", help="Server URL")
     parser.add_argument("--port", type=int, default=8777, help="Server port")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--style", type=str, default="dot", help="Goal condition style for needle throw task")
     args = parser.parse_args()
 
     # Set random seed

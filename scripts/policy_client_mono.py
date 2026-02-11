@@ -60,8 +60,8 @@ class Args:
     #host: str = "127.0.0.1"
     # host: str = "10.162.34.150"
     # host: str = "10.162.34.125"
-    host: str = "10.162.34.145"
-    # host: str = "10.162.34.211"
+    host: str = "10.162.34.202"
+    # host: str = "10.162.34.250"
     port: int = 8000
 
     env: EnvMode = EnvMode.DVRK
@@ -86,7 +86,7 @@ class LowLevelPolicy:
         self.initialize_ros()
         
         self.obs_fn = {
-            EnvMode.DVRK: self.get_observation_dvrk_stereo if self.stereo else self.get_observation_dvrk,
+            EnvMode.DVRK: self.get_observation_dvrk_mono ,
         }[args.env]
 
         self.policy = _websocket_client_policy.WebsocketClientPolicy(
@@ -118,7 +118,7 @@ class LowLevelPolicy:
         self.action_execution_horizon = 20
         self.chunk_size = 50
         
-        self.sleep_rate = 0.03
+        self.sleep_rate = 0.15
         self.state_dim = 16
         self.iter = 0
         self.sketch_img = None
@@ -530,20 +530,14 @@ class LowLevelPolicy:
 
         return observation
 
-    def get_observation_dvrk_stereo(self) -> dict:
+    def get_observation_dvrk_mono(self) -> dict:
 
         self.left_img = np.fromstring(self.rt.usb_image_left.data, np.uint8)
         self.left_img = cv2.imdecode(self.left_img, cv2.IMREAD_COLOR)
-        self.right_img = np.fromstring(self.rt.usb_image_right.data, np.uint8)
-        self.right_img = cv2.imdecode(self.right_img, cv2.IMREAD_COLOR)
-
 
         self.left_img = cv2.cvtColor(self.left_img, cv2.COLOR_BGR2RGB)
         self.left_img = self.left_img / 255.0
 
-        self.right_img = cv2.cvtColor(self.right_img, cv2.COLOR_BGR2RGB)
-        self.right_img = self.right_img / 255.0
-        
 
 
         if self.no_states:
@@ -558,7 +552,6 @@ class LowLevelPolicy:
         return {
             "state": state_result,
             "left_image": self.left_img,
-            "right_image": self.right_img,
             "prompt": "pick up the needle and hand it to the other arm" if self.language_instruction is None else self.language_instruction,
             # "prompt": "needle pickup" if self.language_instruction is None else self.language_instruction,
             # "prompt": "1_needle_pickup" if self.language_instruction is None else self.language_instruction,
