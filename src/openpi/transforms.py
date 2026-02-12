@@ -182,6 +182,282 @@ class Unnormalize(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class Gr00tUnnormalize(DataTransformFn):
+    """GR00T-style denormalization using StateActionProcessor from GR00T repo.
+    
+    This transform directly uses GR00T's StateActionProcessor.unapply_action()
+    to denormalize actions, ensuring 100% consistency with GR00T's inference pipeline.
+    
+    Required parameters:
+    - modality_config_path: Path to GR00T modality config (e.g., dVRK_config.py)
+    - percentile_stats_path: Path to percentile_stats.json from GR00T training
+    - embodiment_tag: Embodiment identifier (e.g., "dvrk", "gr1")
+    
+    Optional parameters:
+    - stats_key: Override for statistics lookup (defaults to embodiment_tag)
+    - use_percentiles: Whether to use percentile normalization (default: True)
+    - clip_outliers: Whether to clip normalized values (default: True)
+    - use_relative_action: Whether actions are in relative format (default: True)
+    
+    Example usage:
+        transform = Gr00tUnnormalize(
+            modality_config_path="/path/to/dVRK_config.py",
+            percentile_stats_path="/path/to/percentile_stats.json",
+            embodiment_tag="dvrk",
+        )
+    """
+    modality_config_path: str
+    percentile_stats_path: str
+    embodiment_tag: str
+    stats_key: str | None = None
+    use_percentiles: bool = True
+    clip_outliers: bool = True
+    use_relative_action: bool = True
+    
+    # Lazy-loaded processor (set in __post_init__)
+    _processor: object | None = dataclasses.field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        """Initialize GR00T StateActionProcessor with modality config and stats."""
+        try:
+            # Import necessary modules
+            import sys
+            import os
+            import json
+            import importlib
+            from pathlib import Path
+            
+            # Import GR00T's StateActionProcessor
+            from gr00t.data.state_action.state_action_processor import StateActionProcessor
+            from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+            
+            # Load modality config by importing the Python file
+            # This registers the config in MODALITY_CONFIGS as a side effect
+            config_path = Path(self.modality_config_path)
+            if not config_path.exists():
+                raise FileNotFoundError(f"Modality config not found: {config_path}")
+            
+            # Add parent directory to sys.path temporarily
+            parent_dir = str(config_path.parent.resolve())
+            if parent_dir not in sys.path:
+                sys.path.insert(0, parent_dir)
+            
+            # Import the module (this registers the config)
+            module_name = config_path.stem
+            importlib.import_module(module_name)
+            
+            # Get the registered config
+            if self.embodiment_tag not in MODALITY_CONFIGS:
+                raise ValueError(
+                    f"Embodiment tag '{self.embodiment_tag}' not found in MODALITY_CONFIGS. "
+                    f"Available: {list(MODALITY_CONFIGS.keys())}"
+                )
+            
+            modality_configs = {self.embodiment_tag: MODALITY_CONFIGS[self.embodiment_tag]}
+            
+            # Load statistics
+            with open(self.percentile_stats_path, "r") as f:
+                percentile_stats = json.load(f)
+            
+            # Add embodiment_tag metadata if not present (for per-dataset stats)
+            stats_key = self.stats_key or self.embodiment_tag
+            if stats_key not in percentile_stats:
+                # Assume stats are at root level - wrap them
+                statistics = {stats_key: percentile_stats}
+            else:
+                statistics = percentile_stats
+            
+            # Initialize processor
+            object.__setattr__(self, "_processor", StateActionProcessor(
+                modality_configs=modality_configs,
+                statistics=statistics,
+                use_percentiles=self.use_percentiles,
+                clip_outliers=self.clip_outliers,
+                apply_sincos_state_encoding=False,
+                use_relative_action=self.use_relative_action,
+            ))
+            
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to initialize GR00T StateActionProcessor: {e}\n"
+                f"Make sure GR00T is available at the expected path and configs are valid."
+            ) from e
+
+    def __call__(self, data: DataDict) -> DataDict:
+        """Denormalize actions using GR00T's StateActionProcessor."""
+        if self._processor is None:
+            raise RuntimeError("StateActionProcessor not initialized")
+        
+        # Extract actions from data
+        if "actions" not in data:
+            return data
+        
+        actions = data["actions"]
+        
+        # Convert OpenPI action format to GR00T format
+        # OpenPI: (T, D) numpy array where D is concatenated dimensions of all groups
+        # GR00T: dict[str, np.ndarray] with separate arrays for each action group
+        
+        # Get modality keys and their dimensions from processor
+        modality_keys = self._processor.modality_configs[self.embodiment_tag]["action"].modality_keys
+        stats_key = self.stats_key or self.embodiment_tag
+        norm_params = self._processor.norm_params[stats_key]["action"]
+        
+        # Get modality config to check action formats
+        from gr00t.data.types import ActionType, ActionFormat
+        action_configs = self._processor.modality_configs[self.embodiment_tag]["action"].action_configs
+        
+        # Debug: print actual action shape
+        print(f"[Gr00tUnnormalize] Input action shape: {actions.shape}")
+        print(f"[Gr00tUnnormalize] Modality keys: {modality_keys}")
+        
+        # Calculate expected dimension from modality config
+        expected_total_dim = 0
+        dim_info = []
+        for idx, key in enumerate(modality_keys):
+            params = norm_params[key]
+            action_config = action_configs[idx] if action_configs and idx < len(action_configs) else None
+            is_eef_xyz_rot6d = (
+                action_config is not None
+                and action_config.type == ActionType.EEF
+                and action_config.format == ActionFormat.XYZ_ROT6D
+            )
+            
+            if is_eef_xyz_rot6d:
+                dim = 9  # 3 (xyz) + 6 (rot6d)
+            else:
+                if "q02" in params:
+                    q02 = params["q02"]
+                    dim = 1 if isinstance(q02, (int, float)) else (q02.shape[0] if q02.ndim == 1 else q02.shape[-1])
+                elif "min" in params:
+                    min_val = params["min"]
+                    dim = 1 if isinstance(min_val, (int, float)) else (min_val.shape[0] if min_val.ndim == 1 else min_val.shape[-1])
+                else:
+                    raise ValueError(f"Cannot determine dimension for action group '{key}'")
+            
+            dim_info.append(f"{key}={dim}")
+            expected_total_dim += dim
+        
+        print(f"[Gr00tUnnormalize] Expected dimensions: {', '.join(dim_info)} (total={expected_total_dim})")
+        
+        # Handle dimension mismatch: if model outputs more dims than needed, truncate
+        if actions.shape[-1] > expected_total_dim:
+            print(f"[Gr00tUnnormalize] WARNING: Model outputs {actions.shape[-1]} dims but only {expected_total_dim} needed. Using first {expected_total_dim} dims.")
+            actions = actions[..., :expected_total_dim]
+        elif actions.shape[-1] < expected_total_dim:
+            raise ValueError(
+                f"Model outputs {actions.shape[-1]} dims but {expected_total_dim} dims required for modality config"
+            )
+        
+        # Split actions into dict format based on dimensions from stats
+        action_dict = {}
+        current_idx = 0
+        
+        for idx, key in enumerate(modality_keys):
+            # Get dimension for this group from normalization params
+            params = norm_params[key]
+            
+            # Determine actual action dimension based on action config
+            action_config = action_configs[idx] if action_configs and idx < len(action_configs) else None
+            is_eef_xyz_rot6d = (
+                action_config is not None
+                and action_config.type == ActionType.EEF
+                and action_config.format == ActionFormat.XYZ_ROT6D
+            )
+            
+            if is_eef_xyz_rot6d:
+                # For XYZ_ROT6D: stats only cover xyz (3D), but action is xyz+rot6d (9D)
+                dim = 9  # 3 (xyz) + 6 (rot6d)
+            else:
+                # For other types, dimension matches stats
+                if "q02" in params:
+                    q02 = params["q02"]
+                    if isinstance(q02, (int, float)):
+                        dim = 1
+                    elif hasattr(q02, 'shape'):
+                        dim = q02.shape[0] if q02.ndim == 1 else q02.shape[-1]
+                    else:
+                        dim = len(q02)
+                elif "min" in params:
+                    min_val = params["min"]
+                    if isinstance(min_val, (int, float)):
+                        dim = 1
+                    elif hasattr(min_val, 'shape'):
+                        dim = min_val.shape[0] if min_val.ndim == 1 else min_val.shape[-1]
+                    else:
+                        dim = len(min_val)
+                else:
+                    raise ValueError(f"Cannot determine dimension for action group '{key}'")
+            
+            # Extract this group's actions
+            action_dict[key] = actions[..., current_idx:current_idx + dim]
+            current_idx += dim
+        
+        # Prepare state dict for hybrid-relative conversion
+        # For hybrid-relative actions, we need current state to convert back to absolute
+        state_dict = None
+        if "state" in data and data["state"] is not None:
+            state = data["state"]
+            print(f"[Gr00tUnnormalize] Raw state shape: {state.shape}, dtype: {state.dtype}")
+            
+            # Split state into dict format matching action groups
+            # State should have same structure as actions (concatenated joint values)
+            state_dict = {}
+            state_idx = 0
+            
+            # Get state dimensions from modality config
+            state_modality_keys = self._processor.modality_configs[self.embodiment_tag]["state"].modality_keys
+            state_norm_params = self._processor.norm_params[stats_key]["state"]
+            
+            print(f"[Gr00tUnnormalize] State modality keys: {state_modality_keys}")
+            
+            for key in state_modality_keys:
+                params = state_norm_params[key]
+                if "q02" in params:
+                    q02 = params["q02"]
+                    dim = 1 if isinstance(q02, (int, float)) else (q02.shape[0] if q02.ndim == 1 else q02.shape[-1])
+                elif "min" in params:
+                    min_val = params["min"]
+                    dim = 1 if isinstance(min_val, (int, float)) else (min_val.shape[0] if min_val.ndim == 1 else min_val.shape[-1])
+                else:
+                    # Skip if no normalization params
+                    continue
+                
+                # Extract state for this group
+                # State is typically (T, D) or just (D,)
+                # For hybrid-relative conversion, GR00T expects state with shape (1, D) for single reference
+                if state.ndim == 1:
+                    state_slice = state[state_idx:state_idx + dim]
+                    # Add batch dimension for GR00T's hybrid-relative conversion
+                    state_dict[key] = state_slice[np.newaxis, :]  # (D,) -> (1, D)
+                else:
+                    state_dict[key] = state[..., state_idx:state_idx + dim]
+                
+                print(f"[Gr00tUnnormalize] State {key}: shape={state_dict[key].shape}, range=[{state_dict[key].min():.4f}, {state_dict[key].max():.4f}]")
+                state_idx += dim
+        
+        # Apply denormalization
+        denormalized_dict = self._processor.unapply_action(
+            action_dict,
+            embodiment_tag=self.embodiment_tag,
+            state=state_dict,  # Pass state for hybrid-relative conversion
+            stats_key=stats_key,
+        )
+        
+        # Debug: print denormalized action shapes
+        for key, value in denormalized_dict.items():
+            print(f"[Gr00tUnnormalize] Denormalized {key}: shape={value.shape}, range=[{value.min():.4f}, {value.max():.4f}]")
+        
+        # Convert back to OpenPI format (concatenate all groups)
+        denormalized_actions = np.concatenate([denormalized_dict[k] for k in modality_keys], axis=-1)
+        print(f"[Gr00tUnnormalize] Final output shape: {denormalized_actions.shape}")
+        print(f"[Gr00tUnnormalize] Output format: absolute xyz + absolute quat for each pose, absolute value for grippers")
+        data["actions"] = denormalized_actions
+        
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class ResizeImages(DataTransformFn):
     height: int
     width: int
