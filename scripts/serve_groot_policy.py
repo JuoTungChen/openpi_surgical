@@ -31,13 +31,13 @@ import logging
 import socket
 from pathlib import Path
 
+import json
+
 import tyro
 
 from openpi.policies import policy as _policy
-from openpi.policies import policy_config as _policy_config
+from openpi.policies.gr00t_policy import Gr00tPolicyConfig, create_gr00t_trained_policy
 from openpi.serving import websocket_policy_server
-from openpi import transforms as _transforms
-from openpi.training import config as _config
 
 
 @dataclasses.dataclass
@@ -61,17 +61,8 @@ class Args:
     # Embodiment tag matching the modality config (e.g., "dvrk", "gr1").
     embodiment_tag: str
 
-    # Optional stats key override. If None, uses embodiment_tag.
+    # Optional stats key override. If None, uses the only key in the stats file.
     stats_key: str | None = None
-
-    # Use percentile normalization (q02/q98). Should match training config.
-    use_percentiles: bool = True
-
-    # Clip outliers during normalization. Should match training config.
-    clip_outliers: bool = True
-
-    # Use relative action representation. Should match training config.
-    use_relative_action: bool = True
 
     # Default prompt to use if not provided in observation data.
     default_prompt: str | None = None
@@ -86,15 +77,15 @@ class Args:
     record_dir: str = "policy_records"
 
 
-def create_groot_policy(args: Args) -> _policy.Policy:
+def create_groot_policy(args: Args) -> _policy.BasePolicy:
     """Create a policy with GR00T StateActionProcessor denormalization.
-    
+
     Args:
         args: Command-line arguments specifying policy configuration.
-    
+
     Returns:
         Policy object ready for serving.
-    
+
     Raises:
         FileNotFoundError: If checkpoint, modality config, or stats file not found.
         ValueError: If configuration is invalid.
@@ -103,66 +94,66 @@ def create_groot_policy(args: Args) -> _policy.Policy:
     checkpoint_path = Path(args.checkpoint_dir)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_path}")
-    
+
     modality_config_path = Path(args.modality_config)
     if not modality_config_path.exists():
         raise FileNotFoundError(f"Modality config not found: {modality_config_path}")
-    
+
     percentile_stats_path = Path(args.percentile_stats)
     if not percentile_stats_path.exists():
         raise FileNotFoundError(f"Percentile stats not found: {percentile_stats_path}")
-    
+
     logging.info("Loading GR00T-style policy...")
     logging.info("  Config: %s", args.config)
     logging.info("  Checkpoint: %s", checkpoint_path)
     logging.info("  Modality config: %s", modality_config_path)
     logging.info("  Percentile stats: %s", percentile_stats_path)
     logging.info("  Embodiment tag: %s", args.embodiment_tag)
-    logging.info("  Use percentiles: %s", args.use_percentiles)
-    logging.info("  Use relative action: %s", args.use_relative_action)
-    
-    # Load training config
-    train_config = _config.get_config(args.config)
-    
-    # Create policy with GR00T StateActionProcessor denormalization
-    policy = _policy_config.create_trained_policy(
-        train_config,
-        checkpoint_path,
+    stats_key = args.stats_key
+    if stats_key is None:
+        stats = json.loads(percentile_stats_path.read_text())
+        if len(stats) == 1:
+            stats_key = next(iter(stats.keys()))
+            logging.info("Resolved stats_key to '%s' from stats file", stats_key)
+        else:
+            raise ValueError(
+                f"stats_key is required when stats file contains multiple entries. Available keys: {list(stats.keys())}"
+            )
+
+    policy_cfg = Gr00tPolicyConfig(
+        train_config_name=args.config,
+        checkpoint_dir=str(checkpoint_path),
+        modality_config_path=str(modality_config_path),
+        embodiment_tag=args.embodiment_tag,
+        stats_path=str(percentile_stats_path),
+        stats_key=stats_key,
         default_prompt=args.default_prompt,
-        norm_stats=None,  # StateActionProcessor handles normalization
-        repack_transforms=_transforms.Group(
-            outputs=[
-                _transforms.Gr00tUnnormalize(
-                    modality_config_path=str(modality_config_path),
-                    percentile_stats_path=str(percentile_stats_path),
-                    embodiment_tag=args.embodiment_tag,
-                    stats_key=args.stats_key,
-                    use_percentiles=args.use_percentiles,
-                    use_relative_action=args.use_relative_action,
-                ),
-            ]
-        ),
     )
-    
+    policy = create_gr00t_trained_policy(policy_cfg)
+
     logging.info("✓ Policy loaded successfully with GR00T StateActionProcessor")
     return policy
 
 
 def main(args: Args) -> None:
     """Main entry point for serving GR00T-style policy.
-    
+
     Args:
         args: Command-line arguments.
     """
     # Create policy with GR00T denormalization
     policy = create_groot_policy(args)
-    policy_metadata = policy.metadata
-    
+    policy_metadata = {
+        "policy_type": "gr00t",
+        "train_config": args.config,
+        "embodiment_tag": args.embodiment_tag,
+    }
+
     # Wrap with recorder if requested
     if args.record:
         logging.info("Recording enabled. Saving to: %s", args.record_dir)
         policy = _policy.PolicyRecorder(policy, args.record_dir)
-    
+
     # Get network information
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
@@ -171,7 +162,7 @@ def main(args: Args) -> None:
     logging.info("  IP: %s", local_ip)
     logging.info("  Port: %d", args.port)
     logging.info("  Metadata: %s", policy_metadata)
-    
+
     # Create and start websocket server
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
@@ -179,11 +170,11 @@ def main(args: Args) -> None:
         port=args.port,
         metadata=policy_metadata,
     )
-    
+
     logging.info("=" * 80)
     logging.info("Server started! Connect clients to ws://%s:%d", local_ip, args.port)
     logging.info("=" * 80)
-    
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
